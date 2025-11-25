@@ -8,13 +8,17 @@ from typhos.suite import SidebarParameter
 from typhos.widgets import (ImageDialogButton, QDialog, SignalDialogButton,
                             TyphosSidebarItem, WaveformDialogButton)
 
+from .conftest import pydm_version_xfail
+
 
 class DialogButton(SignalDialogButton):
-    icon = 'fa.play'
-    text = 'Show Widget'
+    icon = "fa5s.play"
+    text = "Show Widget"
 
     def widget(self):
-        return QWidget(parent=self)
+        widget = QWidget(parent=self)
+        widget.setWindowTitle("dialog button temp widget")
+        return widget
 
 
 @pytest.fixture(scope='function')
@@ -25,10 +29,9 @@ def widget_button(qtbot, monkeypatch):
     return button
 
 
-def test_sidebar_item(qtbot):
+def test_sidebar_item():
     param = SidebarParameter(name='test', embeddable=True)
     item = TyphosSidebarItem(param, 0)
-    qtbot.addWidget(item)
     assert len(item.toolbar.actions()) == 3
     assert item.open_action.isEnabled()
     assert item.embed_action.isEnabled()
@@ -47,20 +50,24 @@ def test_sidebar_item(qtbot):
     assert item.hide_action.isEnabled()
 
 
-def test_signal_dialog_button_show(widget_button):
-    widget_button.show_dialog()
+def test_signal_dialog_button_show(qtbot, widget_button):
+    dialog = widget_button.show_dialog()
     assert widget_button.dialog is not None
     assert widget_button.dialog.isVisible()
     assert len(widget_button.children()) == 1
+    qtbot.add_widget(dialog)
 
 
-def test_signal_dialog_button_repeated_show(widget_button):
+def test_signal_dialog_button_repeated_show(qtbot, widget_button):
     widget_button.show_dialog()
     dialog = widget_button.dialog
     widget_button.show_dialog()
     assert id(dialog) == id(widget_button.dialog)
+    qtbot.add_widget(dialog)
 
 
+@pydm_version_xfail
+@pytest.mark.no_cleanup_check
 @pytest.mark.parametrize('button_type', [WaveformDialogButton,
                                          ImageDialogButton],
                          ids=['Waveform', 'Image'])
@@ -68,6 +75,7 @@ def test_dialog_button_instances_smoke(qtbot, button_type):
     button = button_type(init_channel='ca://Pv:2')
     qtbot.addWidget(button)
     widget = button.widget()
+    qtbot.addWidget(widget)
     assert widget.parent() == button
 
 
@@ -90,3 +98,8 @@ def test_line_edit_history(qtbot, motor):
     # Smoke test menu creation
     menu = widget.widget_ctx_menu()
     qtbot.addWidget(menu)
+
+    # Force cleanup
+    widget.unitMenu.deleteLater()
+    widget.unitMenu = None
+    pydm.utilities.close_widget_connections(widget)

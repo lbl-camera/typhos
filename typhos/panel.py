@@ -10,14 +10,17 @@ Container widgets:
     * :class:`TyphosCompositeSignalPanel`
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 from functools import partial
+from typing import Dict, List, Optional
 
 import ophyd
 from ophyd import Kind
 from ophyd.signal import EpicsSignal, EpicsSignalRO
-from qtpy import QtCore, QtWidgets
+from qtpy import QtCore, QtGui, QtWidgets
 from qtpy.QtCore import Q_ENUMS, Property
 
 from . import display, utils
@@ -153,7 +156,7 @@ class SignalPanel(QtWidgets.QGridLayout):
         """
         return {
             name: info['signal']
-            for name, info in self.signal_name_to_info.items()
+            for name, info in list(self.signal_name_to_info.items())
             if info['signal'] is not None
         }
 
@@ -169,7 +172,7 @@ class SignalPanel(QtWidgets.QGridLayout):
         """
         return {
             name: info['signal']
-            for name, info in self.signal_name_to_info.items()
+            for name, info in list(self.signal_name_to_info.items())
             if info['signal'] is not None and info['visible']
         }
 
@@ -227,20 +230,70 @@ class SignalPanel(QtWidgets.QGridLayout):
         for widget in widgets[1:]:
             widget.setVisible(visible)
 
+        signal_pairs = list(self.signal_name_to_info.items())
         if all(sig_info['widget_info'] is not None
-               for name, sig_info in self.signal_name_to_info.items()):
-            self.loading_complete.emit(list(self.signal_name_to_info))
+               for _, sig_info in signal_pairs):
+            self.loading_complete.emit([name for name, _ in signal_pairs])
 
-    def _create_row_label(self, attr, dotted_name, tooltip):
-        """Create a row label (i.e., the one used to display the name)."""
-        label_text = self.label_text_from_attribute(attr, dotted_name)
+    def _create_row_label(self, attr, dotted_name, tooltip, long_name=None):
+        """
+        Create a row label (i.e., the one used to display the name).
+        If an alternative (human-readable) long name is defined, use that instead
+        and add the dotted_name to the tooltip for hutch python ease of use.
+
+        Parameters
+        -----------
+        attr: any
+            Name of the signal
+        dotted_name: any
+            Full dotted name of the signal
+        tooltip: str
+            Doc string to add to signal
+        long_name: str, optional
+            Long form (human readable) name to use for the signal row label text.
+        """
+        if long_name:
+            label_text = long_name
+        else:
+            label_text = self.label_text_from_attribute(attr, dotted_name)
         label = SignalPanelRowLabel(label_text)
         label.setObjectName(dotted_name)
         if tooltip is not None:
-            label.setToolTip(tooltip)
+            if long_name:
+                _tooltip = dotted_name + '<br>' + round(1.75*len(dotted_name))*'-' + '<br>' + tooltip
+            else:
+                _tooltip = tooltip
+            label.setToolTip(_tooltip)
         return label
 
-    def add_signal(self, signal, name=None, *, tooltip=None):
+    def _get_long_name(self, device, attr, dotted_name):
+        """
+        Check the signal for its long_name, if it exists.
+        Until Ophyd makes it a standard signal, need to manually check
+        the device and its components for the name.
+
+        Parameters
+        -----------
+            device: (any)
+                The Ophyd.Device with component signals
+            attr: (str)
+                The str name of the signal attribute
+            dotted_name: (str)
+                The full dotted name to the signal
+
+        Returns
+        --------
+            str or None
+        """
+        try:
+            if hasattr(getattr(device, attr), 'long_name'):
+                return getattr(device, attr).long_name
+        except AttributeError:
+            # Then maybe we have a nested component and can't touch the signal
+            if hasattr(getattr(device, dotted_name), 'long_name'):
+                return getattr(device, dotted_name).long_name
+
+    def add_signal(self, signal, name=None, long_name=None, *, tooltip=None):
         """
         Add a signal to the panel.
 
@@ -273,15 +326,15 @@ class SignalPanel(QtWidgets.QGridLayout):
 
         logger.debug("Adding signal %s (%s)", signal.name, name)
 
-        label = self._create_row_label(name, name, tooltip)
+        label = self._create_row_label(attr=name, dotted_name=name, long_name=long_name, tooltip=tooltip)
         loading = utils.TyphosLoading(
             timeout_message='Connection timed out.'
         )
 
-        loading_tooltip = ['Connecting to:'] + list(set(
+        loading_tooltip = ['Connecting to:'] + list({
             getattr(signal, attr)
             for attr in ('setpoint_pvname', 'pvname') if hasattr(signal, attr)
-        ))
+        })
         loading.setToolTip('\n'.join(loading_tooltip))
 
         row = self.add_row(label, loading)
@@ -328,8 +381,11 @@ class SignalPanel(QtWidgets.QGridLayout):
 
         logger.debug("Adding component %s", dotted_name)
 
+        # Workaround until Ophyd.Component.long_name PR comes through
+        long_name = self._get_long_name(device, attr, dotted_name)
         label = self._create_row_label(
-            attr, dotted_name, tooltip=component.doc or '')
+            attr=attr, dotted_name=dotted_name, long_name=long_name,
+            tooltip=component.doc or '')
         row = self.add_row(label, None)  # utils.TyphosLoading())
         self.signal_name_to_info[dotted_name] = dict(
             row=row,
@@ -453,7 +509,16 @@ class SignalPanel(QtWidgets.QGridLayout):
 
         return any(filter_by in item for item in items)
 
-    def _should_show(self, kind, name, *, kinds, name_filter):
+    def _should_show(
+        self,
+        kind: ophyd.Kind,
+        name: str,
+        *,
+        kinds: list[ophyd.Kind],
+        name_filter: Optional[str] = None,
+        show_names: Optional[list[str]] = None,
+        omit_names: Optional[list[str]] = None,
+    ):
         """
         Based on the filter settings, indicate if ``signal`` should be shown.
 
@@ -468,15 +533,29 @@ class SignalPanel(QtWidgets.QGridLayout):
         kinds : list of :class:`ophyd.Kind`
             Kinds that should be shown.
 
-        name_filter : str
-            Name filter text.
+        name_filter : str, optional
+            Name filter text - show only signals that match this string. This
+            is applied after the "omit_names" and "show_names" filters.
+
+        show_names : list of str, optinoal
+            Names to explicitly show.  Applied before the omit filter.
+
+        omit_names : list of str, optinoal
+            Names to explicitly omit.
 
         Returns
         -------
         should_show : bool
         """
+        kind = Kind(kind)
         if kind not in kinds:
             return False
+        for show_name in (show_names or []):
+            if show_name and show_name in name:
+                return True
+        for omit_name in (omit_names or []):
+            if omit_name and omit_name in name:
+                return False
         return self._apply_name_filter(name_filter, name)
 
     def _set_visible(self, signal_name, visible):
@@ -527,7 +606,13 @@ class SignalPanel(QtWidgets.QGridLayout):
             del self.signal_name_to_info[signal_name]
         self._connect_signal(signal)
 
-    def filter_signals(self, kinds, name_filter=None):
+    def filter_signals(
+        self,
+        kinds: list[ophyd.Kind],
+        name_filter: Optional[str] = None,
+        show_names: Optional[list[str]] = None,
+        omit_names: Optional[list[str]] = None,
+    ):
         """
         Filter signals based on the given kinds.
 
@@ -537,12 +622,25 @@ class SignalPanel(QtWidgets.QGridLayout):
             List of kinds to show.
 
         name_filter : str, optional
-            Additionally filter signals by name.
+            Name filter text - show only signals that match this string. This
+            is applied after the "omit_names" and "show_names" filters.
+
+        show_names : list of str, optinoal
+            Names to explicitly show.  Applied before the omit filter.
+
+        omit_names : list of str, optinoal
+            Names to explicitly omit.
         """
-        for name, info in self.signal_name_to_info.items():
+        for name, info in list(self.signal_name_to_info.items()):
             item = info['signal'] or info['component']
-            visible = self._should_show(item.kind, name,
-                                        kinds=kinds, name_filter=name_filter)
+            visible = self._should_show(
+                item.kind,
+                name,
+                kinds=kinds,
+                name_filter=name_filter,
+                omit_names=omit_names,
+                show_names=show_names,
+            )
             self._set_visible(name, visible)
 
         self.update()
@@ -610,7 +708,8 @@ class SignalPanel(QtWidgets.QGridLayout):
 
         if self._should_show(kind, dotted_name, **self._filter_settings):
             try:
-                signal = getattr(device, dotted_name)
+                with ophyd.do_not_wait_for_lazy_connection(device):
+                    signal = getattr(device, dotted_name)
             except Exception as ex:
                 logger.warning('Failed to get signal %r from device %s: %s',
                                dotted_name, device.name, ex, exc_info=True)
@@ -643,6 +742,7 @@ class TyphosSignalPanel(TyphosBase, TyphosDesignerMixin, SignalOrder):
 
     Q_ENUMS(SignalOrder)  # Necessary for display in Designer
     SignalOrder = SignalOrder  # For convenience
+    _kinds: Dict[str, Kind]
     # From top of page to bottom
     kind_order = (Kind.hinted, Kind.normal,
                   Kind.config, Kind.omitted)
@@ -662,18 +762,27 @@ class TyphosSignalPanel(TyphosBase, TyphosDesignerMixin, SignalOrder):
         self._panel_layout = self._panel_class()
         self.setLayout(self._panel_layout)
         self._name_filter = ''
+        self._show_names = []
+        self._omit_names = []
         # Add default Kind values
-        self._kinds = dict.fromkeys([kind.name for kind in Kind], True)
+        self._kinds = {
+            "normal": True,
+            "hinted": True,
+            "config": True,
+            "omitted": True,
+        }
         self._signal_order = SignalOrder.byKind
 
         self.setContextMenuPolicy(QtCore.Qt.DefaultContextMenu)
         self.contextMenuEvent = self.open_context_menu
 
-    def _get_kind(self, kind):
+        self.nested_panel = False
+
+    def _get_kind(self, kind: str) -> ophyd.Kind:
         """Property getter for show[kind]."""
         return self._kinds[kind]
 
-    def _set_kind(self, value, kind):
+    def _set_kind(self, value: bool, kind: str) -> None:
         """Property setter for show[kind] = value."""
         # If we have a new value store it
         if value != self._kinds[kind]:
@@ -687,6 +796,8 @@ class TyphosSignalPanel(TyphosBase, TyphosDesignerMixin, SignalOrder):
         """Get the filter settings dictionary."""
         return dict(
             name_filter=self.nameFilter,
+            omit_names=self.omitNames,
+            show_names=self.showNames,
             kinds=self.show_kinds,
         )
 
@@ -696,9 +807,9 @@ class TyphosSignalPanel(TyphosBase, TyphosDesignerMixin, SignalOrder):
         self.updated.emit()
 
     @property
-    def show_kinds(self):
+    def show_kinds(self) -> List[Kind]:
         """Get a list of the :class:`ophyd.Kind` that should be shown."""
-        return [kind for kind in Kind if self._kinds[kind.name]]
+        return [Kind[kind] for kind, show in self._kinds.items() if show]
 
     # Kind Configuration pyqtProperty
     showHints = Property(bool,
@@ -719,14 +830,36 @@ class TyphosSignalPanel(TyphosBase, TyphosDesignerMixin, SignalOrder):
                            doc='Show ophyd.Kind.omitted signals')
 
     @Property(str)
-    def nameFilter(self):
+    def nameFilter(self) -> str:
         """Get or set the current name filter."""
         return self._name_filter
 
     @nameFilter.setter
-    def nameFilter(self, name_filter):
+    def nameFilter(self, name_filter: str):
         if name_filter != self._name_filter:
             self._name_filter = name_filter.strip()
+            self._update_panel()
+
+    @Property("QStringList")
+    def omitNames(self) -> list[str]:
+        """Get or set the list of names to omit."""
+        return self._omit_names
+
+    @omitNames.setter
+    def omitNames(self, omit_names: Optional[list[str]]) -> None:
+        if omit_names != self._omit_names:
+            self._omit_names = list(omit_names or [])
+            self._update_panel()
+
+    @Property("QStringList")
+    def showNames(self) -> list[str]:
+        """Get or set the list of names to omit."""
+        return self._show_names
+
+    @showNames.setter
+    def showNames(self, show_names: Optional[list[str]]) -> None:
+        if show_names != self._show_names:
+            self._show_names = list(show_names or [])
             self._update_panel()
 
     @Property(SignalOrder)
@@ -743,10 +876,17 @@ class TyphosSignalPanel(TyphosBase, TyphosDesignerMixin, SignalOrder):
     def add_device(self, device):
         """Typhos hook for adding a new device."""
         self.devices.clear()
+        self.nested_panel = False
         super().add_device(device)
         # Configure the layout for the new device
         self._panel_layout.add_device(device)
         self._update_panel()
+        parent = self.parent()
+        while parent is not None:
+            if isinstance(parent, TyphosSignalPanel):
+                self.nested_panel = True
+                break
+            parent = parent.parent()
 
     def set_device_display(self, display):
         """Typhos hook for when the TyphosDeviceDisplay is associated."""
@@ -777,6 +917,31 @@ class TyphosSignalPanel(TyphosBase, TyphosDesignerMixin, SignalOrder):
         menu = self.generate_context_menu()
         menu.exec_(self.mapToGlobal(ev.pos()))
 
+    def maybe_fix_parent_size(self):
+        if self.nested_panel:
+            # force this widget's containers to give it enough space!
+            self.parent().setMinimumHeight(self.parent().minimumSizeHint().height())
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        """
+        Fix the parent container's size whenever our size changes.
+
+        This also runs when we add or filter rows.
+        """
+        self.maybe_fix_parent_size()
+        return super().resizeEvent(event)
+
+    def setVisible(self, visible: bool):
+        """
+        Fix the parent container's size whenever we switch visibility.
+
+        This also runs when we toggle a row visibility using the title
+        and when all signal rows get filtered all at once.
+        """
+        rval = super().setVisible(visible)
+        self.maybe_fix_parent_size()
+        return rval
+
 
 class CompositeSignalPanel(SignalPanel):
     """
@@ -804,6 +969,11 @@ class CompositeSignalPanel(SignalPanel):
         The column number for the setpoint widget.
     """
 
+    _qt_designer_ = {
+        "group": "Typhos Widgets",
+        "is_container": False,
+    }
+
     def __init__(self):
         super().__init__(signals=None)
         self._containers = {}
@@ -827,9 +997,10 @@ class CompositeSignalPanel(SignalPanel):
         """
         logger.debug('%s adding sub-device: %s (%s)', self.__class__.__name__,
                      device.name, device.__class__.__name__)
-        container = display.TyphosDeviceDisplay(scrollable=False,
-                                                composite_heuristics=True,
-                                                nested=True)
+        container = display.TyphosDeviceDisplay(
+            scrollable=False,
+            nested=True,
+        )
         self._containers[name] = container
         self.add_row(container)
         container.add_device(device)

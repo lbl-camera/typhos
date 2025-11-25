@@ -1,29 +1,34 @@
 """
 The high-level Typhos Suite, which bundles tools and panels.
 """
+from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import textwrap
 from functools import partial
+from typing import Optional, Union
 
-from pyqtgraph.parametertree import ParameterTree
-from pyqtgraph.parametertree import parameterTypes as ptypes
-from qtpy import QtCore, QtWidgets
-
+import ophyd
 import pcdsutils.qt
+from ophyd import Device
+from pyqtgraph import parametertree
+from pyqtgraph.parametertree import parameterTypes as ptypes
+from qtpy import QtCore, QtGui, QtWidgets
 
 from . import utils, widgets
-from .display import TyphosDeviceDisplay
-from .tools import TyphosConsole, TyphosLogDisplay, TyphosTimePlot
-from .utils import TyphosBase, clean_name, flatten_tree, save_suite
+from .display import DisplayTypes, ScrollOptions, TyphosDeviceDisplay
+from .tools import TyphosLogDisplay, TyphosTimePlot
+from .utils import (TyphosBase, TyphosException, clean_attr, clean_name,
+                    flatten_tree, save_suite)
 
 logger = logging.getLogger(__name__)
 # Use non-None sentinel value since None means no tools
 DEFAULT_TOOLS = object()
 
 
-class SidebarParameter(ptypes.Parameter):
+class SidebarParameter(parametertree.Parameter):
     """
     Parameter to hold information for the sidebar.
 
@@ -52,7 +57,7 @@ class SidebarParameter(ptypes.Parameter):
         self.embeddable = embeddable
         self.devices = list(devices) if devices else []
 
-    def has_device(self, device):
+    def has_device(self, device: ophyd.Device):
         """
         Determine if this parameter contains the given device.
 
@@ -68,9 +73,81 @@ class SidebarParameter(ptypes.Parameter):
         return any(
             (device in self.devices,
              device in getattr(self.value(), 'devices', []),
-             self.name() == device
+             self.name() == device,
+             isinstance(device, str) and self.name() == clean_attr(device),
              )
         )
+
+
+class TyphosDisplayNotCreatedError(TyphosException):
+    """The given subdisplay has not yet been shown."""
+    ...
+
+
+class LazySubdisplay(QtWidgets.QWidget):
+    """
+    A lazy subdisplay which only is instantiated when shown in the suite.
+
+    Supports devices by way of ``add_device``.
+
+    Parameters
+    ----------
+    widget_cls : QtWidgets.QWidget subclass
+        The widget class to instantiate.
+    """
+
+    widget_cls: type[QtWidgets.QWidget]
+    widget: QtWidgets.QWidget | None
+    devices: list[ophyd.Device]
+
+    def __init__(self, widget_cls: type[QtWidgets.QWidget]):
+        super().__init__()
+        self.widget_cls = widget_cls
+        self.widget = None
+
+        self.setVisible(False)
+        self.setLayout(QtWidgets.QVBoxLayout())
+        self.devices = []
+
+    def add_device(self, device: ophyd.Device):
+        """Hook for adding a device from the suite."""
+        self.devices.append(device)
+
+    def hideEvent(self, event: QtGui.QHideEvent):
+        """Hook for when the tool is hidden."""
+        return super().hideEvent(event)
+
+    def _create_widget(self):
+        """Make the widget no longer lazy."""
+        if self.widget is not None:
+            return
+
+        self.widget = self.widget_cls()
+        self.layout().addWidget(self.widget)
+        self.setSizePolicy(self.widget.sizePolicy())
+
+        if hasattr(self.widget, "add_device"):
+            for device in self.devices:
+                self.widget.add_device(device)
+
+    def showEvent(self, event: QtGui.QShowEvent):
+        """Hook for when the tool is shown in the suite."""
+        if self.widget is None:
+            self._create_widget()
+
+        return super().showEvent(event)
+
+    def minimumSizeHint(self):
+        """Minimum size hint forwarder from the embedded widget."""
+        if self.widget is not None:
+            return self.widget.minimumSizeHint()
+        return self.sizeHint()
+
+    def sizeHint(self):
+        """Size hint forwarder from the embedded widget."""
+        if self.widget is not None:
+            return self.widget.sizeHint()
+        return QtCore.QSize(100, 100)
 
 
 class DeviceParameter(SidebarParameter):
@@ -144,6 +221,21 @@ class TyphosSuite(TyphosBase):
     pin : bool, optional
         Pin the parameter tree on startup.
 
+    content_layout : QLayout, optional
+        Sets the layout for when we have multiple subdisplays
+        open in the suite. This will have a horizontal layout by
+        default but can be changed as needed for the use case.
+
+    default_display_type : DisplayType, optional
+        DisplayType enum that determines the type of display to open when we
+        add a device to the suite. Defaults to DisplayType.detailed_screen.
+
+    scroll_option : ScrollOptions, optional
+        ScrollOptions enum that determines the behavior of scrollbars
+        in the suite. Default is ScrollOptions.auto, which enables
+        scrollbars for detailed and engineering screens but not for
+        embedded displays.
+
     Attributes
     ----------
     default_tools : dict
@@ -154,16 +246,25 @@ class TyphosSuite(TyphosBase):
     DEFAULT_TITLE = 'Typhos Suite'
     DEFAULT_TITLE_DEVICE = 'Typhos Suite - {device.name}'
 
-    default_tools = {'Log': TyphosLogDisplay,
-                     'StripTool': TyphosTimePlot,
-                     'Console': TyphosConsole}
+    default_tools = {
+        "Log": TyphosLogDisplay,
+        "StripTool": TyphosTimePlot,
+    }
 
-    def __init__(self, parent=None, *, pin=False):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        pin: bool = False,
+        content_layout: QtWidgets.QLayout | None = None,
+        default_display_type: DisplayTypes = DisplayTypes.embedded_screen,
+        scroll_option: ScrollOptions = ScrollOptions.auto,
+    ):
         super().__init__(parent=parent)
 
         self._update_title()
 
-        self._tree = ParameterTree(parent=self, showHeader=False)
+        self._tree = parametertree.ParameterTree(parent=self, showHeader=False)
         self._tree.setAlternatingRowColors(False)
         self._save_action = ptypes.ActionParameter(name='Save Suite')
         self._tree.addParameters(self._save_action)
@@ -172,10 +273,21 @@ class TyphosSuite(TyphosBase):
         self._bar = pcdsutils.qt.QPopBar(title='Suite', parent=self,
                                          widget=self._tree, pin=pin)
 
+        self._tree.setSizePolicy(
+            QtWidgets.QSizePolicy.MinimumExpanding,
+            QtWidgets.QSizePolicy.MinimumExpanding
+        )
+        self._tree.setMinimumSize(250, 150)
+
         self._content_frame = QtWidgets.QFrame(self)
         self._content_frame.setObjectName("content")
         self._content_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        self._content_frame.setLayout(QtWidgets.QHBoxLayout())
+
+        # Content frame layout: configurable
+        # Defaults to [content] [content] [content] ... in one line
+        if content_layout is None:
+            content_layout = QtWidgets.QHBoxLayout()
+        self._content_frame.setLayout(content_layout)
 
         # Horizontal box layout: [PopBar] [Content Frame]
         layout = QtWidgets.QHBoxLayout()
@@ -186,6 +298,8 @@ class TyphosSuite(TyphosBase):
         layout.addWidget(self._content_frame)
 
         self.embedded_dock = None
+        self.default_display_type = default_display_type
+        self.scroll_option = scroll_option
 
     def add_subdisplay(self, name, display, category):
         """
@@ -209,6 +323,33 @@ class TyphosSuite(TyphosBase):
         parameter = SidebarParameter(value=display, name=name)
         self._add_to_sidebar(parameter, category)
 
+    def add_lazy_subdisplay(
+        self, name: str, display_class: type[QtWidgets.QWidget], category: str
+    ):
+        """
+        Add an arbitrary widget to the tree of available widgets and tools.
+
+        Parameters
+        ----------
+        name : str
+            Name to be displayed in the tree
+
+        display_class : subclass of QWidget
+            QWidget class to show in the dock when expanded.
+
+        category : str
+            The top level group to place the controls under in the tree. If the
+            category does not exist, a new one will be made
+        """
+        logger.debug("Adding lazy subdisplay %r with %r to %r ...",
+                     name, display_class, category)
+        # Create our parameter
+        parameter = SidebarParameter(
+            value=LazySubdisplay(display_class),
+            name=name
+        )
+        self._add_to_sidebar(parameter, category)
+
     @property
     def top_level_groups(self):
         """
@@ -221,11 +362,11 @@ class TyphosSuite(TyphosBase):
             {'name': QGroupParameterItem}
         """
         root = self._tree.invisibleRootItem()
-        return dict((root.child(idx).param.name(),
-                     root.child(idx).param)
-                    for idx in range(root.childCount()))
+        return {root.child(idx).param.name():
+                root.child(idx).param
+                for idx in range(root.childCount())}
 
-    def add_tool(self, name, tool):
+    def add_tool(self, name: str, tool: type[QtWidgets.QWidget]):
         """
         Add a widget to the toolbar.
 
@@ -237,26 +378,29 @@ class TyphosSuite(TyphosBase):
 
         Parameters
         ----------
-        name :str
+        name : str
             Name of tool to be displayed in sidebar
 
-        tool: QWidget
+        tool : QWidget
             Widget to be added to ``.ui.subdisplay``
         """
-        self.add_subdisplay(name, tool, 'Tools')
+        self.add_lazy_subdisplay(name, tool, "Tools")
 
-    def get_subdisplay(self, display):
+    def get_subdisplay(self, display: Union[Device, str], instantiate: bool = True):
         """
         Get a subdisplay by name or contained device.
 
         Parameters
         ----------
-        display :str or Device
+        display : str or Device
             Name of screen or device
+        instantiate : bool, optional
+            Instantiate lazy sub-displays if they do not already exist.
+            Raise otherwise.
 
         Returns
         -------
-        widget : QWidget
+        widget : QWidget or partial
             Widget that is a member of the :attr:`.ui.subdisplay`
 
         Example
@@ -285,38 +429,77 @@ class TyphosSuite(TyphosBase):
 
         subdisplay = display.value()
         if isinstance(subdisplay, partial):
+            if not instantiate:
+                raise TyphosDisplayNotCreatedError(
+                    f"Subdisplay {display} has not been created yet"
+                )
+
             subdisplay = subdisplay()
             display.setValue(subdisplay)
         return subdisplay
 
     @QtCore.Slot(str)
     @QtCore.Slot(object)
-    def show_subdisplay(self, widget):
+    def show_subdisplay(
+        self,
+        widget: Union[QtWidgets.QWidget, SidebarParameter, str],
+    ) -> QtWidgets.QWidget:
         """
         Open a display in the dock system.
 
         Parameters
         ----------
-        widget: QWidget, SidebarParameter or str
+        widget : QWidget, SidebarParameter or str
             If given a ``SidebarParameter`` from the tree, the widget will be
             shown and the sidebar item update. Otherwise, the information is
             passed to :meth:`.get_subdisplay`
+
+        Returns
+        -------
+        widget : QWidget
+            The subdisplay that was shown.
         """
         # Grab true widget
         if not isinstance(widget, QtWidgets.QWidget):
             widget = self.get_subdisplay(widget)
+
         # Setup the dock
         dock = widgets.SubDisplay(self)
         # Set sidebar properly
         self._show_sidebar(widget, dock)
         # Add the widget to the dock
         logger.debug("Showing widget %r ...", widget)
-        if hasattr(widget, 'display_type'):
-            widget.display_type = widget.detailed_screen
-        widget.setVisible(True)
+        if hasattr(widget, 'scroll_option'):
+            widget.scroll_option = self.scroll_option
+        if hasattr(widget, "display_type"):
+            # Setting a display_type implicitly loads the best template.
+            widget.display_type = self.default_display_type
         dock.setWidget(widget)
+
         # Add to layout
-        self._content_frame.layout().addWidget(dock)
+        content_layout = self._content_frame.layout()
+        content_layout.addWidget(dock)
+        if isinstance(content_layout, QtWidgets.QGridLayout):
+            self._content_frame.layout().setAlignment(
+                dock, QtCore.Qt.AlignHCenter
+            )
+            self._content_frame.layout().setAlignment(
+                dock, QtCore.Qt.AlignTop
+            )
+
+        self._new_template()
+        if isinstance(widget, TyphosDeviceDisplay):
+            widget.template_changed.connect(self._new_template)
+        return widget
+
+    def _new_template(self, template: Optional[pathlib.Path] = None) -> None:
+        """Hook for when a new template is selected in a sub-display."""
+        if self.parent() is not None:
+            return
+
+        new_width = self.minimumSizeHint().width()
+        if self.width() < new_width:
+            self.resize(new_width, self.height())
 
     @QtCore.Slot(str)
     @QtCore.Slot(object)
@@ -355,7 +538,12 @@ class TyphosSuite(TyphosBase):
             DockWidget we will close that, otherwise the widget is just hidden.
         """
         if not isinstance(widget, QtWidgets.QWidget):
-            widget = self.get_subdisplay(widget)
+            try:
+                widget = self.get_subdisplay(widget, instantiate=False)
+            except TyphosDisplayNotCreatedError:
+                logger.debug("Subdisplay was never shown; nothing to do: %s", widget)
+                return
+
         sidebar = self._get_sidebar(widget)
         if sidebar:
             for item in sidebar.items:
@@ -427,6 +615,7 @@ class TyphosSuite(TyphosBase):
             Category of device. By default, all devices will just be added to
             the "Devices" group
         """
+
         super().add_device(device)
         self._update_title(device)
         # Create DeviceParameter and add to top level category
@@ -444,8 +633,18 @@ class TyphosSuite(TyphosBase):
                                  device.name, type(tool))
 
     @classmethod
-    def from_device(cls, device, parent=None, tools=DEFAULT_TOOLS, pin=False,
-                    **kwargs):
+    def from_device(
+        cls,
+        device: Device,
+        parent: QtWidgets.QWidget | None = None,
+        tools: dict[str, type] | None | DEFAULT_TOOLS = DEFAULT_TOOLS,
+        pin: bool = False,
+        content_layout: QtWidgets.QLayout | None = None,
+        default_display_type: DisplayTypes = DisplayTypes.detailed_screen,
+        scroll_option: ScrollOptions = ScrollOptions.auto,
+        show_displays: bool = True,
+        **kwargs,
+    ) -> TyphosSuite:
         """
         Create a new :class:`TyphosSuite` from an :class:`ophyd.Device`.
 
@@ -464,15 +663,52 @@ class TyphosSuite(TyphosBase):
             By default these will be ``.default_tools``, but ``None`` can be
             passed to avoid tool loading completely.
 
+        pin : bool, optional
+            Pin the parameter tree on startup.
+
+        content_layout : QLayout, optional
+            Sets the layout for when we have multiple subdisplays
+            open in the suite. This will have a horizontal layout by
+            default but can be changed as needed for the use case.
+
+        default_display_type : DisplayTypes, optional
+            DisplayTypes enum that determines the type of display to open when
+            we add a device to the suite. Defaults to
+            DisplayTypes.detailed_screen.
+
+        scroll_option : ScrollOptions, optional
+            ScrollOptions enum that determines the behavior of scrollbars
+            in the suite. Default is ScrollOptions.auto, which enables
+            scrollbars for detailed and engineering screens but not for
+            embedded displays.
+
+        show_displays : bool, optional
+            If True (default), open all the included device displays.
+            If False, do not open any of the displays.
+
         **kwargs :
             Passed to :meth:`TyphosSuite.add_device`
         """
         return cls.from_devices([device], parent=parent, tools=tools, pin=pin,
+                                content_layout=content_layout,
+                                default_display_type=default_display_type,
+                                scroll_option=scroll_option,
+                                show_displays=show_displays,
                                 **kwargs)
 
     @classmethod
-    def from_devices(cls, devices, parent=None, tools=DEFAULT_TOOLS, pin=False,
-                     **kwargs):
+    def from_devices(
+        cls,
+        devices: list[Device],
+        parent: QtWidgets.QWidget | None = None,
+        tools: dict[str, type] | None | DEFAULT_TOOLS = DEFAULT_TOOLS,
+        pin: bool = False,
+        content_layout: QtWidgets.QLayout | None = None,
+        default_display_type: DisplayTypes = DisplayTypes.detailed_screen,
+        scroll_option: ScrollOptions = ScrollOptions.auto,
+        show_displays: bool = True,
+        **kwargs,
+    ) -> TyphosSuite:
         """
         Create a new TyphosSuite from an iterator of :class:`ophyd.Device`
 
@@ -490,10 +726,39 @@ class TyphosSuite(TyphosBase):
             By default these will be ``.default_tools``, but ``None`` can be
             passed to avoid tool loading completely.
 
+        pin : bool, optional
+            Pin the parameter tree on startup.
+
+        content_layout : QLayout, optional
+            Sets the layout for when we have multiple subdisplays
+            open in the suite. This will have a horizontal layout by
+            default but can be changed as needed for the use case.
+
+        default_display_type : DisplayTypes, optional
+            DisplayTypes enum that determines the type of display to open when
+            we add a device to the suite. Defaults to
+            DisplayTypes.detailed_screen.
+
+        scroll_option : ScrollOptions, optional
+            ScrollOptions enum that determines the behavior of scrollbars
+            in the suite. Default is ScrollOptions.auto, which enables
+            scrollbars for detailed and engineering screens but not for
+            embedded displays.
+
+        show_displays : bool, optional
+            If True (default), open all the included device displays.
+            If False, do not open any of the displays.
+
         **kwargs :
             Passed to :meth:`TyphosSuite.add_device`
         """
-        suite = cls(parent=parent, pin=pin)
+        suite = cls(
+            parent=parent,
+            pin=pin,
+            content_layout=content_layout,
+            default_display_type=default_display_type,
+            scroll_option=scroll_option,
+        )
         if tools is not None:
             logger.info("Loading Tools ...")
             if tools is DEFAULT_TOOLS:
@@ -501,14 +766,16 @@ class TyphosSuite(TyphosBase):
                 tools = cls.default_tools
             for name, tool in tools.items():
                 try:
-                    suite.add_tool(name, tool())
+                    suite.add_tool(name, tool)
                 except Exception:
                     logger.exception("Unable to load %s", type(tool))
+
         logger.info("Adding devices ...")
         for device in devices:
             try:
                 suite.add_device(device, **kwargs)
-                suite.show_subdisplay(device)
+                if show_displays:
+                    suite.show_subdisplay(device)
             except Exception:
                 logger.exception("Unable to add %r to TyphosSuite",
                                  device.name)
@@ -544,6 +811,63 @@ class TyphosSuite(TyphosBase):
     # Add the template to the docstring
     save.__doc__ += textwrap.indent('\n' + utils.saved_template, '\t\t')
 
+    def save_screenshot(
+        self,
+        filename: str,
+    ) -> bool:
+        """Save a screenshot of this widget to ``filename``."""
+
+        image = utils.take_widget_screenshot(self)
+        if image is None:
+            logger.warning("Failed to take screenshot")
+            return False
+
+        logger.info(
+            "Saving screenshot of suite titled '%s' to '%s'",
+            self.windowTitle(), filename,
+        )
+        image.save(filename)
+        return True
+
+    def save_device_screenshots(
+        self,
+        filename_format: str,
+    ) -> dict[str, str]:
+        """Save screenshot(s) of devices to ``filename_format``."""
+
+        filenames = {}
+        for device in self.devices:
+            display = self.get_subdisplay(device)
+
+            if hasattr(display, "to_image"):
+                image = display.to_image()
+            else:
+                # This is a fallback for if/when we don't have a TyphosDisplay
+                image = utils.take_widget_screenshot(display)
+
+            suite_title = self.windowTitle()
+            widget_title = display.windowTitle()
+            if image is None:
+                logger.warning(
+                    "Failed to take screenshot of device: %s in %s",
+                    device.name, suite_title,
+                )
+                continue
+
+            filename = filename_format.format(
+                suite_title=suite_title,
+                widget_title=widget_title,
+                device=device,
+                name=device.name,
+            )
+            logger.info(
+                "Saving screenshot of '%s': '%s' to '%s'",
+                suite_title, widget_title, filename,
+            )
+            image.save(filename)
+            filenames[device.name] = filename
+        return filenames
+
     def _get_sidebar(self, widget):
         items = {}
         for group in self.top_level_groups.values():
@@ -557,7 +881,9 @@ class TyphosSuite(TyphosBase):
             for item in sidebar.items:
                 item._mark_shown()
             # Make sure we react if the dock is closed outside of our menu
-            dock.closing.connect(partial(self.hide_subdisplay, sidebar))
+            self._connect_partial_weakly(
+                dock, dock.closing, self.hide_subdisplay, sidebar
+            )
         else:
             logger.warning("Unable to find sidebar item for %r", widget)
 
@@ -583,13 +909,14 @@ class TyphosSuite(TyphosBase):
             widget.setHidden(True)
 
         logger.debug("Connecting parameter signals ...")
-        parameter.sigOpen.connect(partial(self.show_subdisplay, parameter),
-                                  QtCore.Qt.QueuedConnection)
-        parameter.sigHide.connect(partial(self.hide_subdisplay, parameter),
-                                  QtCore.Qt.QueuedConnection)
+        self._connect_partial_weakly(
+            parameter, parameter.sigOpen, self.show_subdisplay, parameter
+        )
+        self._connect_partial_weakly(
+            parameter, parameter.sigHide, self.hide_subdisplay, parameter
+        )
         if parameter.embeddable:
-            parameter.sigEmbed.connect(
-                partial(self.embed_subdisplay, parameter),
-                QtCore.Qt.QueuedConnection
+            self._connect_partial_weakly(
+                parameter, parameter.sigEmbed, self.embed_subdisplay, parameter
             )
         return parameter

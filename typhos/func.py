@@ -38,7 +38,7 @@ class ParamWidget(QWidget):
     This creates the QLabel for the parameter and defines the interface
     required for subclasses of the ParamWidget.
     """
-    def __init__(self, parameter,  default=inspect._empty, parent=None):
+    def __init__(self, parameter, default=inspect._empty, parent=None):
         super().__init__(parent=parent)
         # Store parameter information
         self.parameter = parameter
@@ -225,7 +225,7 @@ class FunctionDisplay(QGroupBox):
         self.signature = inspect.signature(func)
         self.name = name or self.func.__name__
         # Initialize parent
-        super().__init__('{} Parameters'.format(clean_attr(self.name)),
+        super().__init__(f'{clean_attr(self.name)} Parameters',
                          parent=parent)
         # Ignore certain parameters, args and kwargs by default
         self.hide_params = ['self', 'args', 'kwargs']
@@ -580,7 +580,9 @@ class TyphosMethodButton(QPushButton, TyphosDesignerMixin):
             logger.debug("Setting up new status thread ...")
             self._status_thread = TyphosStatusThread(
                 status, start_delay=self._min_visible_operation,
-                timeout=self._max_allowed_operation)
+                timeout=self._max_allowed_operation,
+                parent=self,
+            )
 
             def status_started():
                 self.setEnabled(False)
@@ -590,12 +592,9 @@ class TyphosMethodButton(QPushButton, TyphosDesignerMixin):
 
             self._status_thread.status_started.connect(status_started)
             self._status_thread.status_finished.connect(status_finished)
+            # Re-enable the button if it's taking too long
+            self._status_thread.status_timeout.connect(status_finished)
 
-            # Connect the finished signal so that even in the worst case
-            # scenario, we re-enable the button. Almost always the button will
-            # be ended by the status_finished signal
-            self._status_thread.finished.connect(partial(status_finished,
-                                                         True))
             logger.debug("Starting TyphosStatusThread ...")
             self._status_thread.start()
 

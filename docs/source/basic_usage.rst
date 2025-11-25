@@ -64,8 +64,19 @@ Ophyd objects so that we can load them in a variety of contexts. If you do not
 use ``happi`` you will need to create your objects and displays in the same
 process.
 
-Here is a quick example if you wanted to get a feel for what ``typhos`` looks
-like with `happi``:
+From the command-line, using typhos and happi together is easy.  For example,
+to load an auto-generated typhos screen for your device named ``"my_device"``
+would only require the following:
+
+.. code:: bash
+
+   $ typhos my_device
+
+typhos automatically configures the happi client, finds your device, and
+creates an appropriate screen for it.
+
+If you are looking to integrate typhos at the Python source code level,
+consider the following example which uses ``typhos`` with ``happi``:
 
 .. code:: python
 
@@ -91,6 +102,34 @@ We can now check that we can load the complete ``SynAxis`` object.
 .. code:: python
 
     motor = client.load_device(name='my_motor')
+
+Signals of Devices
+^^^^^^^^^^^^^^^^^^
+
+When making a custom screen, you can access signals associated with your device
+in several ways, in order of suggested use:
+
+1. By using the typhos built-in "signal" plugin to connect to the signal with
+   the dotted ophyd name, just as you would use in an IPython session.
+   In the designer "channel" property, specify: ``sig://device_name.attr``
+   with as many ``.attrs`` required to reach the signal from the top-level
+   device as needed.
+   For example, for a motor named "my_motor", you could use:
+   ``sig://my_motor.user_readback``
+2. An alternate signal name is available, that which is seen by the data
+   acquisition system (e.g., the databroker by way of bluesky).  Generally,
+   characters seen as invalid for a MongoDB are replaced with an underscore
+   (``_``).  To check a signal's name, see the ``.name`` property of that
+   signal.
+   For example, for a motor named "my_motor", you could use:
+   ``sig://my_motor_user_readback``
+3. By PV name directly.  Assuming your signal is available through the
+   underlying control system (EPICS, for example), you could look and see which
+   PVs your signal talks to and use those directly.  That is,
+   ``my_motor.user_readback.pvname`` would tell you which EPICS PV the user
+   readback uses.  From there, you could set the widget's channel to use EPICS
+   Channel Access with ``ca://pv_name_here``.
+
 
 Display Signals
 ^^^^^^^^^^^^^^^
@@ -171,12 +210,13 @@ loaded.
 
     from ophyd.sim import motor
     from qtpy.QtWidgets import QApplication
-    import typhos
+    from typhos.suite import TyphosSuite
+    from typhos.utils import apply_standard_stylesheets
 
     # Create our application
     app = QApplication([])
-    typhos.use_stylesheet()  # Optional
-    suite = typhos.TyphosSuite.from_device(motor)
+    apply_standard_stylesheets()  # Optional
+    suite = TyphosSuite.from_device(motor)
 
     # Launch
     suite.show()
@@ -185,9 +225,88 @@ loaded.
 
 Using the StyleSheet
 ====================
-While it is no means a requirement, Typhos ships with two stylesheets to
-improve the look of the widgets. By default this isn't activated, but can be
-configured with :func:`typhos.use_stylesheet`. The operator can elect whether
-to use the "light" or "dark" stylesheets by using the optional ``dark``
-keyword. This method also handles setting the "Fusion" ``QStyle`` which helps
+Typhos ships with two stylesheets to improve the look and feel of the widgets.
+When invoking ``typhos`` from the CLI as normal, you can pass
+the ``--dark`` flag to use the dark stylesheet instead of the light mode,
+and a ``--stylesheet-add`` argument to use your own stylesheet in addition to Typhos's.
+If you want to completely ignore Typhos's normal stylesheet loading and use your own,
+you can pass the ``--stylesheet-override`` argument. You can pass these arguments
+multiple times to include multiple stylesheets.
+
+Typhos also uses the same stylesheet environment variables as PyDM to load additional
+stylesheets. The PyDM environment variables respected here are:
+
+- ``PYDM_STYLESHEET``, a path-like variable that should contain file paths to qss
+  stylesheets if set.
+- ``PYDM_STYLESHEET_INCLUDE_DEFAULT``, which should be set to 1 to include the
+  default PyDM stylesheet or unset to not include it.
+
+The priority order for stylesheets in the case of conflicts is:
+
+1. The explicit ``styleSheet`` property on the display template
+2. The style elements from ``--stylesheet-add``
+3. User stylesheets from ``PYDM_STYLESHEET_INCLUDE_DEFAULT``
+4. Typhos's stylesheet (either the dark or the light variant)
+5. The built-in PyDM stylesheet
+
+Outside of the CLI, the stylesheets can be applied using :func:`typhos.apply_standard_stylesheets`.
+This function also handles setting the "Fusion" ``QStyle`` which helps
 make the interface have an operating system independent look and feel.
+
+
+Using the Documentation Widget
+==============================
+
+Typhos has a built-in documentation helper, which allows for the in-line
+linking and display of a user-provided website.
+
+To inform Typhos how to load documentation specific to your facility, please
+customize the following environment variables.
+
+1. ``TYPHOS_HELP_URL`` (str): The help URL format string.  The help URL will
+   be formatted with the ophyd device pertinent to the display, such that you
+   may access its name, PV prefix, happi metadata (if available), and so on.
+   For example, if a Confluence server exists at
+   ``https://my-confluence-site.example.com/Controls/`` with document names
+   that match your devices, ``TYPHOS_HELP_URL`` should be set to
+   ``https://my-confluence-site.example.com/Controls/{device.name}``.
+   If, perhaps, only top-level devices are guaranteed to have documentation,
+   consider using: ``device.root.name`` instead in the format string.
+2. ``TYPHOS_HELP_HEADERS`` (json): headers to pass to HELP_URL.  This should be
+   in a JSON format, such as ``{"my_key":"my_value"}``.
+3. ``TYPHOS_HELP_HEADERS_HOSTS`` (str): comma-delimited hosts that headers may
+   be sent to, aside from the host configured in ``TYPHOS_HELP_URL``.
+4. ``TYPHOS_HELP_TOKEN`` (str): An optional token for the bearer authentication
+   scheme - e.g., personal access tokens with Confluence.  This is a shortcut
+   to add a header ``"Authorization"`` with the value
+   ``"Bearer ${TYPHOS_HELP_TOKEN}"``.
+
+
+Using the Jira Bug Reporting Widget
+===================================
+
+Typhos has an optional built-in widget to generate Jira user stories/bug
+reports.
+
+A prerequisite to this support is, of course, a working Jira installation
+and a pre-configured issue collector.
+
+1. ``TYPHOS_JIRA_URL`` (str): The Jira issue collector URL.  This will resemble
+   ``https://jira.example.com/rest/collectors/1.0/template/custom/...``.
+2. ``TYPHOS_JIRA_HEADERS`` (json): headers to pass to the Jira request, if
+   needed.  This should be in a JSON format, such as ``{"my_key":"my_value"}``.
+3. ``TYPHOS_JIRA_TOKEN`` (str): An optional token for the bearer authentication
+   scheme - e.g., personal access tokens with Confluence.  This is a shortcut
+   to add a header ``"Authorization"`` with the value
+   ``"Bearer ${TYPHOS_JIRA_TOKEN}"``.
+4. ``TYPHOS_JIRA_EMAIL_SUFFIX`` (str): the default e-mail suffix to put on
+   usernames, such as ``"@example.com"``.
+
+
+Launching the Examples
+======================
+There are example screens in the ``typhos.examples`` submodule. After
+installing ``typhos``, you can launch them as follows:
+
+- ``python -m typhos.examples.panel``
+- ``python -m typhos.examples.positioner``

@@ -1,9 +1,9 @@
 import os
 
 import pytest
+from qtpy.QtWidgets import QLabel
 
 import typhos
-from typhos.app import QApplication
 from typhos.cli import typhos_cli
 
 from . import conftest
@@ -12,14 +12,12 @@ from . import conftest
 def test_cli_version(capsys):
     typhos_cli(['--version'])
     readout = capsys.readouterr()
-    assert typhos.__version__ in readout.out
+    assert str(typhos.__version__) in readout.out
 
 
-def test_cli_happi_cfg(monkeypatch, qtbot, happi_cfg):
-    monkeypatch.setattr(QApplication, 'exec_', lambda x: 1)
+def test_cli_happi_cfg(qtbot, happi_cfg):
     window = typhos_cli(['test_motor', '--happi-cfg', happi_cfg])
     qtbot.addWidget(window)
-    assert window.isVisible()
     assert 'test_motor' == window.centralWidget().devices[0].name
 
 
@@ -28,39 +26,38 @@ def test_cli_bad_entry(qtbot, happi_cfg):
     assert window is None
 
 
-def test_cli_no_entry(monkeypatch, qtbot, happi_cfg):
-    monkeypatch.setattr(QApplication, 'exec_', lambda x: 1)
+def test_cli_no_entry(qtbot, happi_cfg):
     window = typhos_cli(['--happi-cfg', happi_cfg])
     qtbot.addWidget(window)
-    assert window.isVisible()
     assert window.centralWidget().devices == []
 
 
-def test_cli_stylesheet(monkeypatch, qapp, qtbot, happi_cfg):
-    monkeypatch.setattr(QApplication, 'exec_', lambda x: 1)
+def test_cli_stylesheet(qapp, qtbot, happi_cfg):
     with open('test.qss', 'w+') as handle:
-        handle.write(
-            "TyphosDeviceDisplay {qproperty-force_template: 'test.ui'}")
-    style = qapp.styleSheet()
-    window = typhos_cli(['test_motor', '--stylesheet', 'test.qss',
-                         '--happi-cfg', happi_cfg])
-    qtbot.addWidget(window)
-    suite = window.centralWidget()
-    dev_display = suite.get_subdisplay(suite.devices[0])
-    assert dev_display.force_template == 'test.ui'
-    qapp.setStyleSheet(style)
-    os.remove('test.qss')
+        handle.write("QLabel {color: red}")
+    try:
+        style = qapp.styleSheet()
+        window = typhos_cli(['test_motor', '--stylesheet', 'test.qss',
+                             '--happi-cfg', happi_cfg])
+        qtbot.addWidget(window)
+        suite = window.centralWidget()
+        qtbot.addWidget(suite)
+        some_label = suite.findChild(QLabel)
+        assert isinstance(some_label, QLabel)
+        color = some_label.palette().color(some_label.foregroundRole())
+        assert color.red() == 255
+    finally:
+        qapp.setStyleSheet(style)
+        os.remove('test.qss')
 
 
 @pytest.mark.parametrize('klass, name', [
     ("ophyd.sim.SynAxis[]", "SynAxis"),
     ("ophyd.sim.SynAxis[{'name':'foo'}]", "foo")
 ])
-def test_cli_class(monkeypatch, qapp, qtbot, klass, name, happi_cfg):
-    monkeypatch.setattr(QApplication, 'exec_', lambda x: 1)
+def test_cli_class(qtbot, klass, name, happi_cfg):
     window = typhos_cli([klass])
     qtbot.addWidget(window)
-    assert window.isVisible()
 
     suite = window.centralWidget()
     assert name == suite.devices[0].name
@@ -74,8 +71,7 @@ def test_cli_class_invalid(qtbot):
     assert window is None
 
 
-def test_cli_profile_modules(monkeypatch, capsys, qapp, qtbot):
-    monkeypatch.setattr(QApplication, 'exec_', lambda x: 1)
+def test_cli_profile_modules(capsys, qtbot):
     window = typhos_cli(['ophyd.sim.SynAxis[]', '--profile-modules',
                          'typhos.suite'])
     qtbot.addWidget(window)
@@ -83,9 +79,7 @@ def test_cli_profile_modules(monkeypatch, capsys, qapp, qtbot):
     assert 'add_device' in output.out
 
 
-def test_cli_benchmark(monkeypatch, capsys, qapp, qtbot):
-    monkeypatch.setattr(QApplication, 'exec_', lambda x: 1)
-    monkeypatch.setattr(QApplication, 'exit', lambda x: 1)
+def test_cli_benchmark(capsys, qtbot):
     windows = typhos_cli(['ophyd.sim.SynAxis[]', '--benchmark',
                           'flat_soft'])
     qtbot.addWidget(windows[0])
@@ -93,8 +87,7 @@ def test_cli_benchmark(monkeypatch, capsys, qapp, qtbot):
     assert 'add_device' in output.out
 
 
-def test_cli_profile_output(monkeypatch, capsys, qapp, qtbot):
-    monkeypatch.setattr(QApplication, 'exec_', lambda x: 1)
+def test_cli_profile_output(capsys, qtbot):
     path_obj = conftest.MODULE_PATH / 'artifacts' / 'prof'
     if not path_obj.parent.exists():
         path_obj.parent.mkdir(parents=True)
