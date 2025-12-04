@@ -7,7 +7,6 @@ __all__ = ['use_stylesheet', 'register_signal', 'load_suite',
            'TyphosMethodButton', '__version__'
            ]
 
-from ._version import get_versions
 from .display import TyphosDeviceDisplay
 from .func import TyphosMethodButton
 from .panel import TyphosCompositeSignalPanel, TyphosSignalPanel
@@ -15,6 +14,7 @@ from .plugins import register_signal
 from .positioner import TyphosPositionerWidget
 from .suite import TyphosSuite
 from .utils import load_suite, patch_connect_slots, use_stylesheet
+from ._version import __version__
 
 # **NOTE** We patch QtCore.QMetaObject.connectSlotsByName to catch SystemError
 # exceptions.
@@ -22,6 +22,4 @@ from .utils import load_suite, patch_connect_slots, use_stylesheet
 # solution, do let us know.
 patch_connect_slots()
 
-__version__ = get_versions()['version']
-del get_versions
 del patch_connect_slots
