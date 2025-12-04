@@ -1,12 +1,16 @@
 """
 Utility functions for typhos
 """
+from __future__ import annotations
+
+import atexit
 import collections
 import contextlib
 import functools
 import importlib.util
 import inspect
 import io
+import json
 import logging
 import operator
 import os
@@ -14,19 +18,28 @@ import pathlib
 import random
 import re
 import threading
+import weakref
+from types import MethodType
+from typing import Dict, Generator, Iterable, Optional
 
+import entrypoints
 import ophyd
 import ophyd.sim
+import pydm
 from ophyd import Device
 from ophyd.signal import EpicsSignalBase, EpicsSignalRO
+from pydm.config import STYLESHEET as PYDM_USER_STYLESHEET
+from pydm.config import STYLESHEET_INCLUDE_DEFAULT as PYDM_INCLUDE_DEFAULT
 from pydm.exception import raise_to_operator  # noqa
+from pydm.utilities.stylesheet import \
+    GLOBAL_STYLESHEET as PYDM_DEFAULT_STYLESHEET
 from pydm.widgets.base import PyDMWritableWidget
 from qtpy import QtCore, QtGui, QtWidgets
 from qtpy.QtCore import QSize
 from qtpy.QtGui import QColor, QMovie, QPainter
 from qtpy.QtWidgets import QWidget
 
-from typhos import plugins
+from . import plugins
 
 try:
     import happi
@@ -34,25 +47,101 @@ except ImportError:
     happi = None
 
 logger = logging.getLogger(__name__)
+
+# Entry point for directories of custom widgets
+# Must be one of:
+# - str
+# - pathlib.Path
+# - list of such objects
+TYPHOS_ENTRY_POINT_KEY = 'typhos.ui'
 MODULE_PATH = pathlib.Path(__file__).parent.resolve()
 ui_dir = MODULE_PATH / 'ui'
 ui_core_dir = ui_dir / 'core'
+
 GrabKindItem = collections.namedtuple('GrabKindItem',
                                       ('attr', 'component', 'signal'))
 DEBUG_MODE = bool(os.environ.get('TYPHOS_DEBUG', False))
 
+# Help settings:
+# TYPHOS_HELP_URL (str): The help URL format string
+HELP_URL = os.environ.get('TYPHOS_HELP_URL', "").strip()
+HELP_WEB_ENABLED = bool(HELP_URL.strip())
+
+# TYPHOS_HELP_HEADERS (json): headers to pass to HELP_URL
+HELP_HEADERS = json.loads(os.environ.get('TYPHOS_HELP_HEADERS', "") or "{}")
+HELP_HEADERS_HOSTS = os.environ.get("TYPHOS_HELP_HEADERS_HOSTS", "").split(",")
+
+# TYPHOS_HELP_TOKEN (str): An optional token for the bearer authentication
+# scheme - e.g., personal access tokens with Confluence
+HELP_TOKEN = os.environ.get('TYPHOS_HELP_TOKEN', None)
+if HELP_TOKEN:
+    HELP_HEADERS["Authorization"] = f"Bearer {HELP_TOKEN}"
+
+# TYPHOS_JIRA_URL (str): The jira REST API collector URL
+JIRA_URL = os.environ.get('TYPHOS_JIRA_URL', "").strip()
+# TYPHOS_JIRA_HEADERS (json): headers to pass to JIRA_URL
+JIRA_HEADERS = json.loads(
+    os.environ.get('TYPHOS_JIRA_HEADERS', '{"X-Atlassian-Token": "no-check"}')
+    or "{}"
+)
+# TYPHOS_JIRA_TOKEN (str): An optional token for the bearer authentication
+# scheme - e.g., personal access tokens with Confluence
+JIRA_TOKEN = os.environ.get('TYPHOS_JIRA_TOKEN', None)
+# TYPHOS_JIRA_EMAIL_SUFFIX (str): The default e-mail address suffix
+JIRA_EMAIL_SUFFIX = os.environ.get('TYPHOS_JIRA_EMAIL_SUFFIX', "").strip()
+if JIRA_TOKEN:
+    JIRA_HEADERS["Authorization"] = f"Bearer {JIRA_TOKEN}"
 
 if happi is None:
     logger.info("happi is not installed; some features may be unavailable")
 
 
+class TyphosException(Exception):
+    ...
+
+
 def _get_display_paths():
-    """Get all display paths based on PYDM_DISPLAYS_PATH + typhos built-ins."""
+    """
+    Get all display paths.
+
+    This includes, in order:
+
+    - The $PYDM_DISPLAYS_PATH environment variable
+    - The typhos.ui entry point
+    - typhos built-ins
+    """
     paths = os.environ.get('PYDM_DISPLAYS_PATH', '')
     for path in paths.split(os.pathsep):
         path = pathlib.Path(path).expanduser().resolve()
         if path.exists() and path.is_dir():
             yield path
+
+    _entries = entrypoints.get_group_all(TYPHOS_ENTRY_POINT_KEY)
+    entry_objs = []
+
+    for entry in _entries:
+        try:
+            obj = entry.load()
+        except Exception:
+            msg = (f'Failed to load {TYPHOS_ENTRY_POINT_KEY} '
+                   f'entry: {entry.name}.')
+            logger.error(msg)
+            logger.debug(msg, exc_info=True)
+            continue
+        if isinstance(obj, list):
+            entry_objs.extend(obj)
+        else:
+            entry_objs.append(obj)
+
+    for obj in entry_objs:
+        try:
+            yield pathlib.Path(obj)
+        except Exception:
+            msg = (f'{TYPHOS_ENTRY_POINT_KEY} entry point '
+                   f'{entry.name}: {obj} is not a valid path!')
+            logger.error(msg)
+            logger.debug(msg, exc_info=True)
+
     yield ui_dir / 'core'
     yield ui_dir / 'devices'
 
@@ -82,11 +171,23 @@ def channel_from_signal(signal, read=True):
     """
     Create a PyDM address from arbitrary signal type
     """
-    # Add an item
     if isinstance(signal, EpicsSignalBase):
         if read:
-            return channel_name(signal._read_pv.pvname)
-        return channel_name(signal._write_pv.pvname)
+            # For readback widgets, focus on the _read_pv only:
+            attrs = ["_read_pv"]
+        else:
+            # For setpoint widgets, _write_pv may exist (and differ) from
+            # _read_pv, try it first:
+            attrs = ["_write_pv", "_read_pv"]
+
+        # Some customizations of EpicsSignalBase may have different attributes.
+        # Try the attributes, but don't fail if they are not present:
+        for attr in attrs:
+            pv_instance = getattr(signal, attr, None)
+            pvname = getattr(pv_instance, "pvname", None)
+            if pvname is not None and isinstance(pvname, str):
+                return channel_name(pvname)
+
     return channel_name(signal.name, protocol='sig')
 
 
@@ -139,9 +240,18 @@ def clean_name(device, strip_parent=True):
     return clean_attr(name)
 
 
-def use_stylesheet(dark=False, widget=None):
+def use_stylesheet(
+    dark: bool = False,
+    widget: QtWidgets.QWidget | None = None,
+) -> None:
     """
     Use the Typhos stylesheet
+
+    This is no longer used directly in typhos in favor of
+    apply_standard_stylesheets.
+
+    This can still be used if you want the legacy behavior of ignoring PyDM
+    environment variables. The function is unchanged.
 
     Parameters
     ----------
@@ -158,10 +268,10 @@ def use_stylesheet(dark=False, widget=None):
         # Load the path to the file
         style_path = os.path.join(ui_dir, 'style.qss')
         if not os.path.exists(style_path):
-            raise EnvironmentError("Unable to find Typhos stylesheet in {}"
-                                   "".format(style_path))
+            raise OSError("Unable to find Typhos stylesheet in {}"
+                          "".format(style_path))
         # Load the stylesheet from the file
-        with open(style_path, 'r') as handle:
+        with open(style_path) as handle:
             style = handle.read()
     if widget is None:
         widget = QtWidgets.QApplication.instance()
@@ -171,6 +281,113 @@ def use_stylesheet(dark=False, widget=None):
 
     # Set Stylesheet
     widget.setStyleSheet(style)
+
+
+def compose_stylesheets(stylesheets: Iterable[str | pathlib.Path]) -> str:
+    """
+    Combine multiple qss stylesheets into one qss stylesheet.
+
+    If two stylesheets make conflicting specifications, the one passed into
+    this function first will take priority.
+
+    This is accomplished by placing the text from the highest-priority
+    stylesheets at the bottom of the combined stylesheet. Stylesheets are
+    evaluated in order from top to bottom, and newer elements on the bottom
+    will override elements at the top.
+
+    Parameters
+    ----------
+    stylesheets : iterable of str or pathlib.Path
+        An itetable, such as a list, of the stylesheets to combine.
+        Each element can either be a fully-loaded stylesheet or a full path to
+        a stylesheet. Stylesheet paths must end in the .qss suffix.
+        In the unlikely event that a string is both a valid path
+        and a valid stylesheet, it will be interpretted as a path,
+        even if no file exists at that path.
+
+    Returns
+    -------
+    composed_style : str
+        A string suitable for passing into QWidget.setStylesheet that
+        incorporates all of the input stylesheets.
+
+    Raises
+    ------
+    OSError
+        If any error is encountered while reading a file
+    TypeError
+        If the input is not a valid type
+    """
+    style_parts = []
+    for sheet in stylesheets:
+        path = pathlib.Path(sheet)
+        if isinstance(sheet, pathlib.Path) or path.suffix == ".qss":
+            with path.open() as fd:
+                style_parts.append(fd.read())
+        elif isinstance(sheet, str):
+            style_parts.append(sheet)
+        else:
+            raise TypeError(f"Invalid input {sheet} of type {type(sheet)}")
+    return "\n".join(reversed(style_parts))
+
+
+def apply_standard_stylesheets(
+    dark: bool = False,
+    paths: Iterable[str] | None = None,
+    include_pydm: bool = True,
+    widget: QtWidgets.QWidget | None = None,
+) -> None:
+    """
+    Apply all the stylesheets at once, along with the Fusion style.
+
+    Applies stylesheets with the following priority order:
+    - Any existing stylesheet data on the widget
+    - User stylesheets in the paths argument
+    - User stylesheets in PYDM_STYLESHEET (which behaves as a path)
+    - Typhos's stylesheet (either the dark or the light variant)
+    - PyDM's built-in stylesheet, if PYDM_STYLESHEET_INCLUDE_DEFAULT is set.
+
+    The Fusion style can only be applied to a QApplication.
+
+    Parameters
+    ----------
+    dark : bool, optional
+        Whether or not to use the QDarkStyleSheet theme. By default the light
+        theme is chosen.
+    paths : iterable of str, optional
+        User-provided paths to stylesheets to apply.
+    include_pydm : bool, optional
+        Whether or not to use the stylesheets defined in the pydm environment
+        variables. Defaults to True.
+    widget : QWidget, optional
+        The widget to apply the stylesheet to.
+        If omitted, apply to the whole QApplication.
+    """
+    if isinstance(widget, QtWidgets.QApplication):
+        widget.setStyle(QtWidgets.QStyleFactory.create('Fusion'))
+
+    stylesheets = []
+
+    if widget is None:
+        widget = QtWidgets.QApplication.instance()
+    stylesheets.append(widget.styleSheet())
+
+    if paths is not None:
+        stylesheets.extend(paths)
+
+    if include_pydm and PYDM_USER_STYLESHEET:
+        stylesheets.extend(PYDM_USER_STYLESHEET.split(os.pathsep))
+
+    if dark:
+        import qdarkstyle
+        stylesheets.append(qdarkstyle.load_stylesheet_pyqt5())
+    else:
+        stylesheets.append(ui_dir / 'style.qss')
+
+    if include_pydm and PYDM_INCLUDE_DEFAULT:
+        stylesheets.append(PYDM_DEFAULT_STYLESHEET)
+
+    widget.setStyleSheet(compose_stylesheets(stylesheets))
 
 
 def random_color():
@@ -247,11 +464,24 @@ class TyphosLoading(QtWidgets.QLabel):
         self._animation.setScaledSize(self._icon_size)
 
 
-class TyphosBase(QWidget):
-    """Base widget for all Typhos widgets that interface with devices"""
+class TyphosObject():
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
         self.devices = list()
+        self._weak_partials_ = []
+
+        # Check if a QWidget is already initialized (multiple inheritance case)
+        mro = type(self).__mro__
+        typhos_object_index = mro.index(TyphosObject)
+        has_other_qwidget = any(
+            'QtWidgets' in cls.__module__ or cls is TyphosBase
+            for cls in mro[:typhos_object_index]
+        )
+
+        if not has_other_qwidget:
+            # Normal case: initialize the full chain
+            super().__init__(*args, **kwargs)
+        else:
+            pass
 
     def add_device(self, device):
         """
@@ -298,6 +528,148 @@ class TyphosBase(QWidget):
         return instance
 
 
+class WeakPartialMethodSlot:
+    """
+    A PyQt-compatible slot for a partial method.
+
+    This utility handles deleting the connection when the method class instance
+    gets garbage collected. This avoids cycles in the garbage collector
+    that would prevent the instance from being garbage collected prior to the
+    program exiting.
+
+    Parameters
+    ----------
+    signal_owner : QtCore.QObject
+        The owner of the signal.
+    signal : QtCore.Signal
+        The signal instance itself.
+    method : instance method
+        The method slot to call when the signal fires.
+    *args :
+        Arguments to pass to the method.
+    **kwargs :
+        Keyword arguments to pass to the method.
+    """
+    def __init__(
+        self,
+        signal_owner: QtCore.QObject,
+        signal: QtCore.Signal,
+        method: MethodType,
+        *args,
+        **kwargs
+    ):
+        self.signal = signal
+        self.signal.connect(self._call, QtCore.Qt.QueuedConnection)
+        self.method = weakref.WeakMethod(method)
+        self._method_finalizer = weakref.finalize(
+            method.__self__, self._method_destroyed
+        )
+        self._signal_finalizer = weakref.finalize(
+            signal_owner, self._signal_destroyed
+        )
+        self.partial_args = args
+        self.partial_kwargs = kwargs
+
+    def _signal_destroyed(self):
+        """Callback: the owner of the signal was destroyed; clean up."""
+        if self.signal is None:
+            return
+
+        self.method = None
+        self.partial_args = []
+        self.partial_kwargs = {}
+        self.signal = None
+
+    def _method_destroyed(self):
+        """Callback: the owner of the method was destroyed; clean up."""
+        if self.signal is None:
+            return
+
+        self.method = None
+        self.partial_args = []
+        self.partial_kwargs = {}
+        try:
+            self.signal.disconnect(self._call)
+        except Exception:
+            ...
+        self.signal = None
+
+    def _call(self, *new_args):
+        """
+        PyQt callback slot which handles the internal WeakMethod.
+
+        This method currently throws away arguments passed in from the signal.
+        This is for backward-compatibility to how the previous
+        `partial()`-using implementation worked.
+
+        If reused beyond the TyphosSuite, this class may need revisiting in the
+        future.
+        """
+        method = self.method()
+        if method is None:
+            self._method_destroyed()
+            return
+
+        return method(*self.partial_args, **self.partial_kwargs)
+
+
+class TyphosBase(TyphosObject, QWidget):
+    """Base widget for all Typhos widgets that interface with devices"""
+
+    _weak_partials_: list[WeakPartialMethodSlot]
+
+    def __init__(self, *args, **kwargs):
+        self._weak_partials_ = []
+        # Check if a QWidget is already initialized (multiple inheritance case)
+        mro = type(self).__mro__
+        typhos_base_index = mro.index(TyphosBase)
+        has_other_qwidget = any(
+            'QtWidgets' in cls.__module__
+            for cls in mro[:typhos_base_index]
+        )
+
+        if not has_other_qwidget:
+            # Normal case: initialize the full chain
+            try:
+                QWidget.__init__(self, kwargs.get('parent', None))
+            except TypeError:
+                print('blah')
+            super().__init__(*args, **kwargs)
+        else:
+            # Multiple inheritance case: just initialize TyphosObject
+            TyphosObject.__init__(self)
+
+    def _connect_partial_weakly(
+        self,
+        signal_owner: QtCore.QObject,
+        signal: QtCore.Signal,
+        method: MethodType,
+        *args,
+        **kwargs
+    ):
+        """
+        Connect the provided signal to an instance method via
+        WeakPartialMethodSlot.
+
+        Parameters
+        ----------
+        signal_owner : QtCore.QObject
+            The owner of the signal.
+        signal : QtCore.Signal
+            The signal instance itself.
+        method : instance method
+            The method slot to call when the signal fires.
+        *args :
+            Arguments to pass to the method.
+        **kwargs :
+            Keyword arguments to pass to the method.
+        """
+        slot = WeakPartialMethodSlot(
+            signal_owner, signal, method, *args, **kwargs
+        )
+        self._weak_partials_.append(slot)
+
+
 def make_identifier(name):
     """Make a Python string into a valid Python identifier"""
     # That was easy
@@ -338,7 +710,7 @@ def reload_widget_stylesheet(widget, cascade=False):
     """Reload the stylesheet of the provided widget"""
     widget.style().unpolish(widget)
     widget.style().polish(widget)
-    widget.update()
+    QWidget.update(widget)
     if cascade:
         for child in widget.children():
             if isinstance(child, QWidget):
@@ -653,7 +1025,7 @@ def code_from_device(device):
 import happi
 from happi.loader import from_container
 client = happi.Client.from_config()
-md = client.find_device(name="{happi_name}")
+md = client.find_item(name="{happi_name}")
 {device.name} = from_container(md)
 '''
 
@@ -898,6 +1270,25 @@ class DeviceConnectionMonitorThread(QtCore.QThread):
         self.include_lazy = include_lazy
         self._update_event = threading.Event()
 
+        atexit.register(self.stop)
+
+    def stop(self, *, wait_ms: int = 1000):
+        """
+        Stop the background thread and clean up.
+
+        Parameters
+        ----------
+        wait_ms : int, optional
+            Time to wait for the background thread to exit.  Set to 0 to
+            disable.
+        """
+        if not self.isRunning():
+            return
+
+        self.requestInterruption()
+        if wait_ms > 0:
+            self.wait(msecs=wait_ms)
+
     def callback(self, obj, connected, **kwargs):
         self._update_event.set()
         self.connection_update.emit(obj, connected, kwargs)
@@ -909,7 +1300,7 @@ class DeviceConnectionMonitorThread(QtCore.QThread):
         with connection_status_monitor(*signals, callback=self.callback):
             while not self.isInterruptionRequested():
                 self._update_event.clear()
-                self._update_event.wait(timeout=0.5)
+                self._update_event.wait(timeout=0.25)
 
 
 class ObjectConnectionMonitorThread(QtCore.QThread):
@@ -932,6 +1323,25 @@ class ObjectConnectionMonitorThread(QtCore.QThread):
         self.status = None
         self.lock = threading.Lock()
         self._update_event = threading.Event()
+
+        atexit.register(self.stop)
+
+    def stop(self, *, wait_ms: int = 1000):
+        """
+        Stop the background thread and clean up.
+
+        Parameters
+        ----------
+        wait_ms : int, optional
+            Time to wait for the background thread to exit.  Set to 0 to
+            disable.
+        """
+        if not self.isRunning():
+            return
+
+        self.requestInterruption()
+        if wait_ms > 0:
+            self.wait(msecs=wait_ms)
 
     def clear(self):
         if self.status:
@@ -969,7 +1379,7 @@ class ObjectConnectionMonitorThread(QtCore.QThread):
                 self.lock.release()
                 while not self.isInterruptionRequested():
                     self._update_event.clear()
-                    self._update_event.wait(timeout=0.5)
+                    self._update_event.wait(timeout=0.25)
         finally:
             if self.lock.locked():
                 self.lock.release()
@@ -1007,6 +1417,21 @@ class ThreadPoolWorker(QtCore.QRunnable):
 def _get_top_level_components(device_cls):
     """Get all top-level components from a device class."""
     return list(device_cls._sig_attrs.items())
+
+
+def find_root_widget(widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
+    """
+    Finds the root ancestor of a widget.
+
+    Parameters
+    ----------
+    widget : QWidget
+        The widget from which to start the search
+    """
+    parent = widget
+    while parent.parent() is not None:
+        parent = parent.parent()
+    return parent
 
 
 def find_parent_with_class(widget, cls=QWidget):
@@ -1257,3 +1682,202 @@ def linked_attribute(property_attr, widget_attr, hide_unavailable=False):
 
         return wrapped
     return wrapper
+
+
+def raise_window(widget):
+    """
+    Bring a widget's window into focus and on top of the window stack.
+
+    If the window is minimized, unminimize it.
+
+    Different window managers respond differently to the various
+    methods called here, the chosen sequence was intended for
+    good behavior on as many systems as possible.
+    """
+    window = widget.window()
+    window.hide()
+    window.show()
+    if window.isMinimized():
+        window.showNormal()
+    window.raise_()
+    window.activateWindow()
+    window.setFocus()
+
+
+class FrameOnEditFilter(QtCore.QObject):
+    """
+    A QLineEdit event filter for editing vs not editing style handling.
+    This will make the QLineEdit look like a QLabel when the user is
+    not editing it.
+    """
+    def eventFilter(self, object: QtWidgets.QLineEdit, event: QtCore.QEvent) -> bool:
+        # Even if we install only on line edits, this can be passed a generic
+        # QWidget when we remove and clean up the line edit widget.
+        if not isinstance(object, QtWidgets.QLineEdit):
+            return False
+        if event.type() == QtCore.QEvent.FocusIn:
+            self.set_edit_style(object)
+            return False
+        if event.type() == QtCore.QEvent.FocusOut:
+            self.set_no_edit_style(object)
+            return False
+        return False
+
+    @staticmethod
+    def set_edit_style(object: QtWidgets.QLineEdit):
+        """
+        Set a QLineEdit to the look and feel we want for editing.
+        Parameters
+        ----------
+        object : QLineEdit
+            Any line edit widget.
+        """
+        object.setFrame(True)
+        color = object.palette().color(QtGui.QPalette.ColorRole.Base)
+        object.setStyleSheet(
+            f"QLineEdit {{ background: rgba({color.red()},"
+            f"{color.green()}, {color.blue()}, {color.alpha()})}}"
+        )
+        object.setReadOnly(False)
+
+    @staticmethod
+    def set_no_edit_style(object: QtWidgets.QLineEdit):
+        """
+        Set a QLineEdit to the look and feel we want for not editing.
+        Parameters
+        ----------
+        object : QLineEdit
+            Any line edit widget.
+        """
+        if object.text():
+            object.setFrame(False)
+            object.setStyleSheet(
+                "QLineEdit { background: transparent }"
+            )
+        object.setReadOnly(True)
+
+
+def take_widget_screenshot(widget: QtWidgets.QWidget) -> Optional[QtGui.QImage]:
+    """Take a screenshot of the given widget, returning a QImage."""
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        # No apps, no screenshots!
+        return None
+
+    try:
+        primary_screen: QtGui.QScreen = app.primaryScreen()
+        logger.debug("Primary screen: %s", primary_screen)
+
+        screen = (
+            widget.screen()
+            if hasattr(widget, "screen")
+            else primary_screen
+        )
+
+        logger.info(
+            "Screenshot: %s (%s, primary screen: %s widget screen: %s)",
+            widget.windowTitle(),
+            widget,
+            primary_screen.name(),
+            screen.name(),
+        )
+        return screen.grabWindow(widget.winId())
+    except RuntimeError as ex:
+        # The widget may have been deleted already; do not fail in this
+        # scenario.
+        logger.debug("Widget %s screenshot failed due to: %s", type(widget), ex)
+        return None
+
+
+def take_top_level_widget_screenshots(
+    *, visible_only: bool = True,
+) -> Generator[
+    tuple[QtWidgets.QWidget, QtGui.QImage], None, None
+]:
+    """
+    Yield screenshots of all top-level widgets.
+
+    Parameters
+    ----------
+    visible_only : bool, optional
+        Only take screenshots of visible widgets.
+
+    Yields
+    ------
+    widget : QtWidgets.QWidget
+        The widget relating to the screenshot.
+
+    screenshot : QtGui.QImage
+        The screenshot image.
+    """
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        # No apps, no screenshots!
+        return
+
+    for screen_idx, screen in enumerate(app.screens(), 1):
+        logger.debug(
+            "Screen %d: %s %s %s",
+            screen_idx,
+            screen,
+            screen.name(),
+            screen.geometry(),
+        )
+
+    def by_title(widget):
+        return widget.windowTitle() or str(id(widget))
+
+    def should_take_screenshot(widget: QtWidgets.QWidget) -> bool:
+        try:
+            parent = widget.parent()
+            visible = widget.isVisible()
+        except RuntimeError:
+            # Widget could have been gc'd in the meantime
+            return False
+
+        if isinstance(widget, QtWidgets.QMenu):
+            logger.debug(
+                "Skipping QMenu for screenshots. %s parent=%s",
+                widget,
+                parent,
+            )
+            return False
+        if visible_only and not visible:
+            return False
+        return True
+
+    for widget in sorted(app.topLevelWidgets(), key=by_title):
+        if should_take_screenshot(widget):
+            image = take_widget_screenshot(widget)
+            if image is not None:
+                yield widget, image
+
+
+def load_ui_file(
+    uifile: str,
+    macros: Optional[Dict[str, str]] = None,
+) -> pydm.Display:
+    """
+    Load a .ui file, perform macro substitution, then return the resulting QWidget.
+
+    Parameters
+    ----------
+    uifile : str
+        The path to a .ui file to load.
+    macros : dict, optional
+        A dictionary of macro variables to supply to the file to be opened.
+
+    Returns
+    -------
+    pydm.Display
+    """
+
+    display = pydm.Display(macros=macros)
+    try:
+        display.load_ui_from_file(uifile, macros)
+    except Exception as ex:
+        ex.pydm_display = display
+        raise
+
+    return display

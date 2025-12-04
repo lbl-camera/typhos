@@ -1,11 +1,19 @@
+from __future__ import annotations
+
 import numpy as np
 import pydm.utilities
-from ophyd import Signal
-from pydm.widgets import PyDMLineEdit
+import pytest
+from ophyd import Component as Cpt
+from ophyd import Device, Signal
+from ophyd.sim import EnumSignal
+from pydm import PyDMApplication
+from pydm.widgets import PyDMChannel, PyDMLineEdit
+from pytestqt.qtbot import QtBot
+
+from typhos.plugins.core import (SignalConnection, register_signal,
+                                 signal_registry)
 
 from ..conftest import DeadSignal, RichSignal
-from typhos.plugins.core import (SignalPlugin, SignalConnection,
-                                 register_signal)
 
 
 def test_signal_connection(qapp, qtbot):
@@ -52,6 +60,16 @@ def test_signal_connection(qapp, qtbot):
     assert sig.get() == 3
 
 
+def test_dotted_name():
+    class TestDevice(Device):
+        test = Cpt(Signal)
+
+    device = TestDevice(name='test')
+    register_signal(device.test)
+
+    assert 'test.test' in signal_registry
+
+
 def test_metadata(qapp, qtbot):
     widget = PyDMLineEdit()
     qtbot.addWidget(widget)
@@ -68,20 +86,108 @@ def test_metadata(qapp, qtbot):
     assert widget._prec == 2
 
 
+def test_find_signal(qapp, qtbot):
+    widget = PyDMLineEdit()
+    qtbot.addWidget(widget)
+    widget.channel = 'sig://md_signal'
+    listener = widget.channels()[0]
+    # Override the signal getter method to test
+    sig = RichSignal(name='md_signal', value=1)
+
+    class CustomConnection(SignalConnection):
+        def find_signal(self, address):
+            return sig
+
+    _ = CustomConnection(listener, 'md_signal')
+    qapp.processEvents()
+    # Check that metadata the metadata got there
+    assert widget.enum_strings == ('a', 'b', 'c')
+    assert widget._unit == 'urad'
+    assert widget._prec == 2
+
+
+MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "sig_name,value,prec,expected",
+    [
+        # float: None -> 3
+        ("none_prec_signal_float", 1.5, None, 3),
+        # float: Missing -> 3
+        ("missing_prec_signal_float", 1.5, MISSING, 3),
+        # float: 4 -> 4
+        ("prec_signal_float", 2.718, 4, 4),
+        # np float: 5 -> 5
+        ("prec_signal_np_float", np.float32(3.14), 5, 5),
+        # int: None -> 0
+        ("no_prec_signal_int", 1, None, 0),
+        # int: 2 -> 2
+        ("prec_signal_int", 2, 2, 2),
+        # float: 0 -> 3
+        ("zero_prec_float", 1.618, 0, 3),
+        # float: -2 -> 3
+        ("neg_prec_float", 4.5, -2, 3),
+        # int: -30 -> 0
+        ("neg_prec_int", 5, -30, 0),
+    ],
+)
+def test_precision_defaults(
+    sig_name: str,
+    value: int | float | np.floating,
+    prec: int | None,
+    expected: int,
+    qapp: PyDMApplication,
+    qtbot: QtBot,
+):
+    """
+    Expected behavior:
+
+    - If a precision is zero, negative, or missing, use the
+      default precision of 3 for floats, 0 for ints.
+    - If a precision is valid and given, use the given precision.
+    """
+    widget = PyDMLineEdit()
+    qtbot.addWidget(widget)
+    widget.channel = f"sig://{sig_name}"
+    listener = widget.channels()[0]
+    # Create a signal and attach our listener
+    if prec is None:
+        # Use normal signal defaults, incl precision=None
+        sig = Signal(name=sig_name, value=value)
+    elif prec is MISSING:
+        # Force a fully empty metadata dict
+        sig = RichSignal(
+            name=sig_name,
+            value=value,
+            metadata={},
+        )
+    else:
+        # Specify the precision precisely
+        sig = RichSignal(
+            name=sig_name,
+            value=value,
+            metadata={"precision": prec},
+        )
+    register_signal(sig)
+    _ = SignalConnection(listener, sig_name)
+    qapp.processEvents()
+    assert widget._prec == expected
+
+
 def test_disconnection(qtbot):
     widget = PyDMLineEdit()
     qtbot.addWidget(widget)
     widget.channel = 'sig://invalid'
     listener = widget.channels()[0]
-    plugin = SignalPlugin()
     # Non-existant signal doesn't raise an error
-    plugin.add_connection(listener)
+    listener.connect()
     # Create a signal that will raise a TimeoutError
     sig = DeadSignal(name='broken_signal', value=1)
     register_signal(sig)
     listener.address = 'sig://broken_signal'
     # This should fail on the subscribe
-    plugin.add_connection(listener)
+    listener.connect()
     # This should fail on the get
     sig.subscribable = True
     _ = SignalConnection(listener, 'broken_signal')
@@ -105,4 +211,54 @@ def test_array_signal_put_value(qapp, qtbot):
     widget.channel = 'sig://my_array_write'
     widget.send_value_signal[np.ndarray].emit(np.zeros(4))
     qapp.processEvents()
-    assert all(sig.value == np.zeros(4))
+    assert all(sig.get() == np.zeros(4))
+
+
+def test_add_listener_order(qapp):
+    sig = EnumSignal(name="my_listener", value=0, enum_strings=("zero", "one", "two"))
+    register_signal(sig)
+
+    order = []
+
+    def new_value(*args, **kwargs):
+        order.append("value")
+
+    def new_meta(*args, **kwargs):
+        order.append("meta")
+
+    chan = PyDMChannel(address="sig://my_listener", value_slot=new_value, enum_strings_slot=new_meta)
+    _ = SignalConnection(chan, "my_listener", "sig")
+    qapp.processEvents()
+
+    assert order == ["meta", "value"]
+
+
+def test_enum_casts(qapp):
+    sig = Signal(name="my_enum_caster", value=0)
+    register_signal(sig)
+
+    chan = PyDMChannel(address="sig://my_enum_caster")
+    conn = SignalConnection(chan, "my_enum_caster", "sig")
+    qapp.processEvents()
+
+    conn.enum_strs = ("1", "2", "5")
+
+    # First, keep type as an int
+    assert conn.cast("1") == 0
+    assert conn.cast("2") == 1
+    assert conn.cast("5") == 2
+    assert conn.cast(0) == 0
+    assert conn.cast(1) == 1
+    assert conn.cast(2) == 2
+
+    # Try str next
+    conn.signal_type = None
+    sig.put("2")
+    qapp.processEvents()
+
+    assert conn.cast("1") == "1"
+    assert conn.cast("2") == "2"
+    assert conn.cast("5") == "5"
+    assert conn.cast(0) == "1"
+    assert conn.cast(1) == "2"
+    assert conn.cast(2) == "5"

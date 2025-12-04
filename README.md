@@ -3,15 +3,7 @@
   <h3>Automated User Interface Creation from Ophyd Devices</h3>
 </p>
 
-[![Build Status](https://travis-ci.org/pcdshub/typhos.svg?branch=master)](https://travis-ci.org/pcdshub/typhos)
-[![codecov.io](https://codecov.io/github/pcdshub/typhos/coverage.svg?branch=master)](https://codecov.io/github/pcdshub/typhos?branch=master)
-
-> **WARNING**: This package was renamed.
->
-> The last version supporting the `typhon` package name and command-line tool
-> was v0.7.0.  Please upgrade to `typhos` or pin to that version.
-
-EPICS is a flexible and powerful controls system to access to experimental
+EPICS is a flexible and powerful controls system that gives access to experimental
 information, however, the relation and meaning of process variables is often
 obscure. Many of the user interfaces for EPICS information reflect this, as
 walls of buttons and flashing lights bombard the user with little thought to
@@ -45,10 +37,9 @@ All `-tag` channels have `-dev` counterparts for bleeding edge installations.
 Both `requirements.txt` and optional `dev-requirements.txt` are kept up to date
 as well for those who prefer installation via `pip`
 
-If installed in this manner, in an environment that is not **root**, the
-environment variables will be setup in such a way that the Typhos widgets will
-immediately be available in the `QtDesigner`. Otherwise, see the
-``typhos_env.sh`` script contained in the ``etc`` folder of this repository.
+typhos utilizes PyDM's designer widget entrypoints.  This means that if you
+have PyDM working correctly with the Qt Designer, typhos widgets will also be
+available.  No further customization or environment settings are required.
 
 `happi` is an optional dependency but is recommended. This must be installed
 manually if not using the CONDA recipe.

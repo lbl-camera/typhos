@@ -22,7 +22,7 @@ from qtpy.QtCore import Property, QObject, QSize, Qt, Signal, Slot
 from qtpy.QtWidgets import (QAction, QDialog, QDockWidget, QPushButton,
                             QToolBar, QVBoxLayout, QWidget)
 
-from . import plugins, utils, variety
+from . import dynamic_font, plugins, utils, variety
 from .textedit import TyphosTextEdit  # noqa: F401
 from .tweakable import TyphosTweakable  # noqa: F401
 from .variety import use_for_variety_read, use_for_variety_write
@@ -157,6 +157,41 @@ class TyphosComboBox(pydm.widgets.PyDMEnumComboBox):
     Notes
     -----
     """
+    def __init__(self, *args, variety_metadata=None, ophyd_signal=None,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ophyd_signal = ophyd_signal
+        self._ophyd_enum_strings = None
+        self._md_sub = ophyd_signal.subscribe(
+            self._metadata_update, event_type="meta"
+        )
+
+    def __dtor__(self):
+        """PyQt5 destructor hook."""
+        if self._md_sub is not None:
+            self.ophyd_signal.unsubscribe(self._md_sub)
+            self._md_sub = None
+
+    def _metadata_update(self, enum_strs=None, **kwargs):
+        if enum_strs:
+            self._ophyd_enum_strings = tuple(enum_strs)
+            self.enum_strings_changed(enum_strs)
+
+    def enum_strings_changed(self, new_enum_strings):
+        current_idx = self.currentIndex()
+        super().enum_strings_changed(
+            tuple(self._ophyd_enum_strings or new_enum_strings)
+        )
+        self.value_changed(current_idx)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent):
+        event.ignore()
+
+
+class NoScrollComboBox(QtWidgets.QComboBox):
+    """
+    A combobox disconnected from direct EPICS/ophyd with scrolling ignored.
+    """
     def wheelEvent(self, event: QtGui.QWheelEvent):
         event.ignore()
 
@@ -174,12 +209,18 @@ class TyphosLineEdit(pydm.widgets.PyDMLineEdit):
         self._channel = None
         self._setpoint_history_count = 5
         self._setpoint_history = collections.deque(
-            [],  self._setpoint_history_count)
+            [], self._setpoint_history_count)
 
         super().__init__(*args, **kwargs)
         self.showUnits = True
         if display_format is not None:
             self.displayFormat = display_format
+
+    def __dtor__(self):
+        menu = self.unitMenu
+        if menu is not None:
+            menu.deleteLater()
+        self.unitMenu = None
 
     @property
     def setpoint_history(self):
@@ -261,10 +302,10 @@ class TyphosLineEdit(pydm.widgets.PyDMLineEdit):
     def widget_ctx_menu(self):
         menu = super().widget_ctx_menu()
         if self._setpoint_history_count > 0:
-            self._history_menu = self._create_history_menu()
-            if self._history_menu is not None:
+            history_menu = self._create_history_menu()
+            if history_menu is not None:
                 menu.addSeparator()
-                menu.addMenu(self._history_menu)
+                menu.addMenu(history_menu)
 
         return menu
 
@@ -306,7 +347,9 @@ class TyphosLabel(pydm.widgets.PyDMLabel):
     Notes
     -----
     """
-    def __init__(self, *args, display_format=None, **kwargs):
+    def __init__(
+        self, *args, display_format=None, ophyd_signal=None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.setAlignment(Qt.AlignCenter)
         self.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
@@ -314,6 +357,28 @@ class TyphosLabel(pydm.widgets.PyDMLabel):
         self.showUnits = True
         if display_format is not None:
             self.displayFormat = display_format
+
+        self.ophyd_signal = ophyd_signal
+        self._ophyd_enum_strings = None
+        self._md_sub = ophyd_signal.subscribe(
+            self._metadata_update, event_type="meta"
+        )
+
+    def __dtor__(self):
+        """PyQt5 destructor hook."""
+        if self._md_sub is not None:
+            self.ophyd_signal.unsubscribe(self._md_sub)
+            self._md_sub = None
+
+    def _metadata_update(self, enum_strs=None, **kwargs):
+        if enum_strs:
+            self._ophyd_enum_strings = tuple(enum_strs)
+            self.enum_strings_changed(enum_strs)
+
+    def enum_strings_changed(self, new_enum_strings):
+        super().enum_strings_changed(
+            tuple(self._ophyd_enum_strings or new_enum_strings)
+        )
 
     def unit_changed(self, new_unit):
         """
@@ -334,6 +399,18 @@ class TyphosLabel(pydm.widgets.PyDMLabel):
         if new_unit.lower() in EXPONENTIAL_UNITS and default:
             self.displayFormat = DisplayFormat.Exponential
 
+    @Property(bool, "dynamicFontSize")
+    def dynamic_font_size(self) -> bool:
+        """Dynamically adjust the font size"""
+        return dynamic_font.is_patched(self)
+
+    @dynamic_font_size.setter
+    def dynamic_font_size(self, value: bool):
+        if value:
+            dynamic_font.patch_widget(self)
+        else:
+            dynamic_font.unpatch_widget(self)
+
 
 class TyphosSidebarItem(ParameterItem):
     """
@@ -350,15 +427,15 @@ class TyphosSidebarItem(ParameterItem):
         self.toolbar.setIconSize(QSize(15, 15))
         # Setup the action to open the widget
         self.open_action = QAction(
-            qta.icon('fa.square', color='green'), 'Open', self.toolbar)
+            qta.icon('fa5s.square', color='green'), 'Open', self.toolbar)
         self.open_action.triggered.connect(self.open_requested)
         # Setup the action to embed the widget
         self.embed_action = QAction(
-            qta.icon('fa.th-large', color='yellow'), 'Embed', self.toolbar)
+            qta.icon('fa5s.th-large', color='yellow'), 'Embed', self.toolbar)
         self.embed_action.triggered.connect(self.embed_requested)
         # Setup the action to hide the widget
         self.hide_action = QAction(
-            qta.icon('fa.times-circle', color='red'), 'Close', self.toolbar)
+            qta.icon('fa5s.times-circle', color='red'), 'Close', self.toolbar)
         self.hide_action.triggered.connect(self.hide_requested)
         self.hide_action.setEnabled(False)
         # Add actions to toolbars
@@ -422,8 +499,8 @@ class HappiChannel(pydm.widgets.channel.PyDMChannel, QObject):
     """
 
     def __init__(self, *, tx_slot, **kwargs):
-        super().__init__(**kwargs)
         QObject.__init__(self)
+        super().__init__(**kwargs)
         self._tx_slot = tx_slot
         self._last_md = None
 
@@ -443,6 +520,11 @@ class TyphosDesignerMixin(pydm.widgets.base.PyDMWidget):
     """
     A mixin class used to display Typhos widgets in the Qt designer.
     """
+
+    _qt_designer_ = {
+        "group": "Typhos Widgets",
+        "is_container": False,
+    }
 
     # Unused properties that we don't want visible in designer
     alarmSensitiveBorder = Property(bool, designable=False)
@@ -497,11 +579,11 @@ class SignalDialogButton(QPushButton):
         self.channel = init_channel
         self.setIconSize(QSize(15, 15))
 
-    def widget(self, channel):
+    def widget(self):
         """Return a widget created with channel"""
         raise NotImplementedError
 
-    def show_dialog(self):
+    def show_dialog(self) -> QDialog:
         """Show the channel in a QDialog"""
         # Dialog Creation
         if not self.dialog:
@@ -523,6 +605,7 @@ class SignalDialogButton(QPushButton):
         # Show the dialog
         logger.debug("Showing QDialog for %r", self.channel)
         self.dialog.show()
+        return self.dialog
 
 
 @use_for_variety_read('array-image')
@@ -533,8 +616,8 @@ class ImageDialogButton(SignalDialogButton):
     Notes
     -----
     """
-    text = 'Show Image'
-    icon = 'fa.camera'
+    text = "Show Image"
+    icon = "fa5s.camera"
     parent_widget_class = QtWidgets.QMainWindow
 
     def widget(self):
@@ -553,7 +636,7 @@ class WaveformDialogButton(SignalDialogButton):
     -----
     """
     text = 'Show Waveform'
-    icon = 'fa5s.chart-line'
+    icon = "fa5s.chart-line"
     parent_widget_class = QtWidgets.QMainWindow
 
     def widget(self):
@@ -833,7 +916,11 @@ class TyphosScalarRange(pydm.widgets.PyDMSlider):
     def __dtor__(self):
         """PyQt5 destructor hook"""
         # Ensure our delta signal subscription is cleared:
-        self.delta_signal = None
+        if self._delta_signal is not None:
+            if self._delta_signal_sub is not None:
+                self._delta_signal.unsubscribe(self._delta_signal_sub)
+                self._delta_signal_sub = None
+            self.delta_signal = None
 
     @variety.key_handler('range')
     def _variety_key_handler_range(self, value, source, **kwargs):
@@ -880,6 +967,7 @@ class TyphosScalarRange(pydm.widgets.PyDMSlider):
     def delta_signal(self, signal):
         if self._delta_signal is not None:
             self._delta_signal.unsubscribe(self._delta_signal_sub)
+            self._delta_signal_sub = None
 
         if signal is None:
             return
@@ -1042,6 +1130,9 @@ def _get_ndimensional_widget_class(dimensions, desc, variety_md, read_only):
     }.get(dimensions, TyphosLabel)
 
 
+DIRECT_CONTROL_LAYERS = {"pyepics", "caproto"}
+
+
 def widget_type_from_description(signal, desc, read_only=False):
     """
     Determine which widget class should be used for the given signal
@@ -1064,7 +1155,14 @@ def widget_type_from_description(signal, desc, read_only=False):
     kwargs : dict
         Keyword arguments for the class
     """
-    if isinstance(signal, EpicsSignalBase):
+    use_pv_directly = (
+        # We can use PyDM's data source directly with EpicsSignalBase:
+        isinstance(signal, EpicsSignalBase) and
+        # So long as its underlying control layer is a supported ophyd-provided
+        # one, at least.
+        getattr(signal.cl, "name", "") in DIRECT_CONTROL_LAYERS
+    )
+    if use_pv_directly:
         # Still re-route EpicsSignal through the ca:// plugin
         pv = (signal._read_pv
               if read_only else signal._write_pv)

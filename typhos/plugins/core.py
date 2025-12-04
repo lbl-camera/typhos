@@ -4,10 +4,10 @@ Module Docstring
 import logging
 
 import numpy as np
-from qtpy.QtCore import Qt, Slot
-
-from ophyd.utils.epics_pvs import _type_map
+from ophyd import Signal
+from ophyd.utils.epics_pvs import AlarmSeverity, _type_map
 from pydm.data_plugins.plugin import PyDMConnection, PyDMPlugin
+from qtpy.QtCore import Qt, Slot
 
 from ..utils import raise_to_operator
 
@@ -21,14 +21,41 @@ def register_signal(signal):
     Add a new Signal to the registry.
 
     The Signal object is kept within ``signal_registry`` for reference by name
-    in the :class:`.SignalConnection`. Signals can be added multiple times and
-    overwritten but a warning will be emitted.
+    in the :class:`.SignalConnection`. Signals can be added multiple times,
+    but only the first register_signal call for each unique signal name
+    has any effect.
+
+    Signals can be referenced by their ``name`` attribute or by their
+    full dotted path starting from the parent's name.
     """
+    # Pick all the name aliases (name, dotted path)
+    if signal is signal.root:
+        names = (signal.name,)
+    else:
+        # .dotted_name does not include the root device's name
+        names = (
+            signal.name,
+            '.'.join((signal.root.name, signal.dotted_name)),
+        )
     # Warn the user if they are adding twice
-    if signal.name in signal_registry:
-        logger.debug("A signal named %s is already registered!", signal.name)
-        return
-    signal_registry[signal.name] = signal
+    for name in names:
+        if name in signal_registry:
+            # Case 1: harmless re-add
+            if signal_registry[name] is signal:
+                logger.debug(
+                    "The signal named %s is already registered!",
+                    name,
+                )
+            # Case 2: harmful overwrite! Name collision!
+            else:
+                logger.warning(
+                    "A different signal named %s is already registered!",
+                    name,
+                )
+            return
+    logger.debug("Registering signal with names %s", names)
+    for name in names:
+        signal_registry[name] = signal
 
 
 class SignalConnection(PyDMConnection):
@@ -53,14 +80,49 @@ class SignalConnection(PyDMConnection):
     def __init__(self, channel, address, protocol=None, parent=None):
         # Create base connection
         super().__init__(channel, address, protocol=protocol, parent=parent)
-        self.signal_type = None
+        self._connection_open: bool = True
+        self.signal_type: type | None = None
+        self.is_float: bool = False
+        self.enum_strs: tuple[str, ...] = ()
+
         # Collect our signal
-        self.signal = signal_registry[address]
+        self.signal = self.find_signal(address)
         # Subscribe to updates from Ophyd
-        self._cid = self.signal.subscribe(self.send_new_value,
-                                          event_type=self.signal.SUB_VALUE)
+        self.value_cid = self.signal.subscribe(
+            self.send_new_value,
+            event_type=self.signal.SUB_VALUE,
+        )
+        self.meta_cid = self.signal.subscribe(
+            self.send_new_meta,
+            event_type=self.signal.SUB_META,
+        )
         # Add listener
         self.add_listener(channel)
+
+    def __dtor__(self) -> None:
+        self._connection_open = False
+        self.close()
+
+    def find_signal(self, address: str) -> Signal:
+        """Find a signal in the registry given its address.
+
+        This method is intended to be overridden by subclasses that
+        may use a different mechanism to keep track of signals.
+
+        Parameters
+        ----------
+        address
+          The connection address for the signal. E.g. in
+          "sig://sim_motor.user_readback" this would be the
+          "sim_motor.user_readback" portion.
+
+        Returns
+        -------
+        Signal
+          The Ophyd signal corresponding to the address.
+
+        """
+        return signal_registry[address]
 
     def cast(self, value):
         """
@@ -83,7 +145,26 @@ class SignalConnection(PyDMConnection):
                          dtype, self.signal.name, self.signal_type)
 
         logger.debug("Casting %r to %r", value, self.signal_type)
-        if self.signal_type is np.ndarray:
+        if self.enum_strs:
+            # signal_type is either int or str
+            # use enums to cast type
+            if self.signal_type is int:
+                # Get the index
+                try:
+                    value = self.enum_strs.index(value)
+                except (TypeError, ValueError, AttributeError):
+                    value = int(value)
+            elif self.signal_type is str:
+                # Get the enum string
+                try:
+                    value = self.enum_strs[value]
+                except (TypeError, ValueError):
+                    value = str(value)
+            else:
+                raise TypeError(
+                    f"Invalid combination: enum_strs={self.enum_strs} with signal_type={self.signal_type}"
+                )
+        elif self.signal_type is np.ndarray:
             value = np.asarray(value)
         else:
             value = self.signal_type(value)
@@ -113,12 +194,66 @@ class SignalConnection(PyDMConnection):
         """
         Update the UI with a new value from the Signal.
         """
+        if not self._connection_open:
+            return
+
         try:
             value = self.cast(value)
             self.new_value_signal[self.signal_type].emit(value)
         except Exception:
             logger.exception("Unable to update %r with value %r.",
                              self.signal.name, value)
+
+    def send_new_meta(
+            self,
+            connected=None,
+            write_access=None,
+            severity=None,
+            precision=None,
+            units=None,
+            enum_strs=None,
+            **kwargs
+    ):
+        """
+        Update the UI with new metadata from the Signal.
+
+        Signal metadata updates always send all available metadata, so
+        default values to this function will not be sent ever if the signal
+        has valid data there.
+
+        We default missing metadata to None and skip emitting in general,
+        but for severity we default to NO_ALARM for UI purposes. We don't
+        want the UI to assume that anything is in an alarm state.
+        """
+        if not self._connection_open:
+            return
+
+        # Only emit the non-None values
+        if connected is not None:
+            self.connection_state_signal.emit(connected)
+        if write_access is not None:
+            self.write_access_signal.emit(write_access)
+        if precision is not None:
+            if precision <= 0:
+                # Help the user a bit by replacing a clear design error
+                # with a sensible default
+                if self.is_float:
+                    # Float precision at 0 is unhelpful
+                    precision = 3
+                else:
+                    # Integer precision can't be negative
+                    precision = 0
+            self.prec_signal.emit(precision)
+        if units is not None:
+            self.unit_signal.emit(units)
+        if enum_strs is not None:
+            self.enum_strings_signal.emit(enum_strs)
+            self.enum_strs = enum_strs
+
+        # Special handling for severity
+        if severity is None:
+            severity = AlarmSeverity.NO_ALARM
+        self.new_severity_signal.emit(severity)
 
     def add_listener(self, channel):
         """
@@ -131,32 +266,30 @@ class SignalConnection(PyDMConnection):
         # Perform the default connection setup
         logger.debug("Adding %r ...", channel)
         super().add_listener(channel)
-        # Report as no-alarm state
-        self.new_severity_signal.emit(0)
         try:
             # Gather the current value
             signal_val = self.signal.get()
             # Gather metadata
-            signal_desc = self.signal.describe()[self.signal.name]
+            signal_meta = self.signal.metadata
         except Exception:
             logger.exception("Failed to gather proper information "
                              "from signal %r to initialize %r",
                              self.signal.name, channel)
             return
-        # Report as connected
-        self.write_access_signal.emit(True)
-        self.connection_state_signal.emit(True)
-        # Report metadata
-        for (field, signal) in (
-                    ('precision', self.prec_signal),
-                    ('enum_strs', self.enum_strings_signal),
-                    ('units', self.unit_signal)):
-            # Check if we have metadata to send for field
-            val = signal_desc.get(field)
-            # If so emit it to our listeners
-            if val:
-                signal.emit(val)
-        # Report new value
+        if isinstance(signal_val, (float, np.floating)):
+            # Precision is commonly omitted from non-epics signals
+            # Pick a sensible default for displaying floats
+            self.is_float = True
+            # precision might be missing entirely
+            signal_meta.setdefault("precision", 3)
+            # precision might be None, which is code for unset
+            if signal_meta["precision"] is None:
+                signal_meta["precision"] = 3
+        else:
+            self.is_float = False
+
+        # Report new meta for context, then value
+        self.send_new_meta(**signal_meta)
         self.send_new_value(signal_val)
         # If the channel is used for writing to PVs, hook it up to the
         # 'put' methods.
@@ -181,7 +314,7 @@ class SignalConnection(PyDMConnection):
         if channel.value_signal is not None and not destroying:
             for _typ in self.supported_types:
                 try:
-                    channel.value_signal[_typ].disconnect(self.put_value)
+                    channel.value_signal[_typ].disconnect(self.put_value, destroying)
                 except (KeyError, TypeError):
                     logger.debug("Unable to disconnect value_signal from %s "
                                  "for type %s", channel.address, _typ)
@@ -191,7 +324,8 @@ class SignalConnection(PyDMConnection):
 
     def close(self):
         """Unsubscribe from the Ophyd signal."""
-        self.signal.unsubscribe(self._cid)
+        self.signal.unsubscribe(self.value_cid)
+        self.signal.unsubscribe(self.meta_cid)
 
 
 class SignalPlugin(PyDMPlugin):
@@ -214,3 +348,14 @@ class SignalPlugin(PyDMPlugin):
         except Exception:
             logger.exception("Unable to create a connection to %r",
                              channel)
+
+    def remove_connection(self, channel, destroying=False):
+        try:
+            return super().remove_connection(channel, destroying=destroying)
+        except RuntimeError as ex:
+            # deleteLater() at teardown can raise; let's silence that
+            if not str(ex).endswith("has been deleted"):
+                raise
+
+            with self.lock:
+                self.connections.pop(self.get_connection_id(channel), None)

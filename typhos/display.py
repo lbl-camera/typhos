@@ -1,12 +1,19 @@
 """Contains the main display widget used for representing an entire device."""
+from __future__ import annotations
 
+import copy
 import enum
+import inspect
 import logging
 import os
 import pathlib
+import webbrowser
+from pathlib import Path
+from typing import Dict, List, Optional, Union
 
 import ophyd
 import pcdsutils
+import pydm
 import pydm.display
 import pydm.exception
 import pydm.utilities
@@ -16,7 +23,10 @@ from qtpy.QtCore import Q_ENUMS, Property, Qt, Slot
 
 from . import cache
 from . import panel as typhos_panel
-from . import utils, widgets
+from . import utils, web, widgets
+from .jira import TyphosJiraIssueWidget
+from .notes import TyphosNotesEdit
+from .plugins.core import register_signal
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +38,31 @@ class DisplayTypes(enum.IntEnum):
     detailed_screen = 1
     engineering_screen = 2
 
+    @property
+    def friendly_name(self) -> str:
+        """A user-friendly name for the display type."""
+        return {
+            self.embedded_screen: "Embedded",
+            self.detailed_screen: "Detailed",
+            self.engineering_screen: "Engineering",
+        }[self]
+
 
 _DisplayTypes = utils.pyqt_class_from_enum(DisplayTypes)
 DisplayTypes.names = [view.name for view in DisplayTypes]
+
+
+class ScrollOptions(enum.IntEnum):
+    """Enumeration of scrollable options for displays."""
+
+    auto = 0
+    scrollbar = 1
+    no_scroll = 2
+
+
+_ScrollOptions = utils.pyqt_class_from_enum(ScrollOptions)
+ScrollOptions.names = [view.name for view in ScrollOptions]
+
 
 DEFAULT_TEMPLATES = {
     name: [(utils.ui_dir / 'core' / f'{name}.ui').resolve()]
@@ -44,7 +76,9 @@ DEFAULT_TEMPLATES_FLATTEN = [f for _, files in DEFAULT_TEMPLATES.items()
                              for f in files]
 
 
-def normalize_display_type(display_type):
+def normalize_display_type(
+    display_type: Union[DisplayTypes, str, int]
+) -> DisplayTypes:
     """
     Normalize a given display type.
 
@@ -65,10 +99,45 @@ def normalize_display_type(display_type):
     """
     try:
         return DisplayTypes(display_type)
-    except Exception as ex:
-        if display_type in DisplayTypes.names:
-            return getattr(DisplayTypes, display_type)
-        raise ValueError(f'Unrecognized display type: {display_type}') from ex
+    except ValueError:
+        try:
+            return DisplayTypes[display_type]
+        except KeyError:
+            raise ValueError(
+                f'Unrecognized display type: {display_type}'
+            )
+
+
+def normalize_scroll_option(
+    scroll_option: Union[ScrollOptions, str, int]
+) -> ScrollOptions:
+    """
+    Normalize a given scroll option.
+
+    Parameters
+    ----------
+    display_type : ScrollOptions, str, or int
+        The display type.
+
+    Returns
+    -------
+    display_type : ScrollOptions
+        The normalized :class:`ScrollOptions`.
+
+    Raises
+    ------
+    ValueError
+        If the input cannot be made a :class:`ScrollOptions`.
+    """
+    try:
+        return ScrollOptions(scroll_option)
+    except ValueError:
+        try:
+            return ScrollOptions[scroll_option]
+        except KeyError:
+            raise ValueError(
+                f'Unrecognized scroll option: {scroll_option}'
+            )
 
 
 class TyphosToolButton(QtWidgets.QToolButton):
@@ -152,7 +221,7 @@ class TyphosDisplayConfigButton(TyphosToolButton):
 
     def __init__(self, icon=None, *, parent=None):
         super().__init__(icon=icon, parent=parent)
-        self.setPopupMode(self.InstantPopup)
+        self.setPopupMode(self.ToolButtonPopupMode.InstantPopup)
         self.setArrowType(Qt.NoArrow)
         self.templates = None
         self.device_display = None
@@ -219,8 +288,8 @@ class TyphosDisplayConfigButton(TyphosToolButton):
 
         line_edit = QtWidgets.QLineEdit()
 
-        filters = list(set(panel.nameFilter for panel in panels
-                           if panel.nameFilter))
+        filters = list({panel.nameFilter for panel in panels
+                        if panel.nameFilter})
         if len(filters) == 1:
             line_edit.setText(filters[0])
         else:
@@ -305,28 +374,22 @@ class TyphosDisplayConfigButton(TyphosToolButton):
         if not display:
             return base_menu
 
-        panels = display.findChildren(typhos_panel.TyphosSignalPanel) or []
-        if not panels:
-            return base_menu
-
-        base_menu.addSection('Templates')
         display._generate_template_menu(base_menu)
 
-        base_menu.addSection('Filters')
-        filter_menu = base_menu.addMenu("&Kind filter")
-        self.create_kind_filter_menu(panels, filter_menu, only=False)
-        filter_menu.addSeparator()
-        self.create_kind_filter_menu(panels, filter_menu, only=True)
+        panels = display.findChildren(typhos_panel.TyphosSignalPanel) or []
+        if panels:
+            base_menu.addSection('Filters')
+            filter_menu = base_menu.addMenu("&Kind filter")
+            self.create_kind_filter_menu(panels, filter_menu, only=False)
+            filter_menu.addSeparator()
+            self.create_kind_filter_menu(panels, filter_menu, only=True)
+            self.create_name_filter_menu(panels, base_menu)
+            base_menu.addSeparator()
+            self.create_hide_empty_menu(panels, base_menu)
 
-        self.create_name_filter_menu(panels, base_menu)
-
-        base_menu.addSeparator()
-        self.create_hide_empty_menu(panels, base_menu)
-
-        if utils.DEBUG_MODE:
-            base_menu.addSection('Debug')
-            action = base_menu.addAction('&Copy to clipboard')
-            action.triggered.connect(display.copy_to_clipboard)
+        base_menu.addSection('Tools')
+        action = base_menu.addAction('&Copy screenshot to clipboard')
+        action.triggered.connect(display.copy_to_clipboard)
 
         return base_menu
 
@@ -334,6 +397,7 @@ class TyphosDisplayConfigButton(TyphosToolButton):
 class TyphosDisplaySwitcherButton(TyphosToolButton):
     """A button which switches the TyphosDeviceDisplay template on click."""
 
+    templates: Optional[List[pathlib.Path]]
     template_selected = QtCore.Signal(pathlib.Path)
 
     icons = {'embedded_screen': 'compress',
@@ -345,30 +409,32 @@ class TyphosDisplaySwitcherButton(TyphosToolButton):
         super().__init__(icon=self.icons[display_type], parent=parent)
         self.templates = None
 
-    def _clicked(self):
+    def _clicked(self) -> None:
         """Clicked callback - set the template."""
         if self.templates is None:
             logger.warning('set_device_display not called on %s', self)
             return
 
-        try:
-            template = self.templates[0]
-        except IndexError:
-            return
+        # Show all our options in the context menu:
+        super()._clicked()
 
-        self.template_selected.emit(template)
-
-    def generate_context_menu(self):
+    def generate_context_menu(self) -> Optional[QtWidgets.QMenu]:
         """Context menu request."""
         if not self.templates:
-            return
+            return None
 
         menu = QtWidgets.QMenu(parent=self)
+        menu.addSection("Switch to screen")
+
+        prefix = os.path.commonprefix(list(str(tpl) for tpl in self.templates))
+        if len(prefix) <= 1:
+            prefix = ""
+
         for template in self.templates:
-            def selected(*, template=template):
+            def selected(*, template: pathlib.Path = template):
                 self.template_selected.emit(template)
 
-            action = menu.addAction(template.name)
+            action = menu.addAction(str(template)[len(prefix):])
             action.triggered.connect(selected)
 
         return menu
@@ -376,6 +442,12 @@ class TyphosDisplaySwitcherButton(TyphosToolButton):
 
 class TyphosDisplaySwitcher(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
     """Display switcher set of buttons for use with a TyphosDeviceDisplay."""
+
+    help_toggle_button: TyphosHelpToggleButton
+    jira_report_button: Optional[TyphosJiraReportButton]
+    buttons: Dict[str, TyphosToolButton]
+    config_button: TyphosDisplayConfigButton
+    _jira_widget: TyphosJiraIssueWidget
 
     template_selected = QtCore.Signal(pathlib.Path)
 
@@ -398,19 +470,29 @@ class TyphosDisplaySwitcher(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
 
         self._create_ui()
 
+    def new_jira_widget(self):
+        """Open a new Jira issue reporting widget."""
+        if self.device_display is None:
+            logger.warning('set_device_display not called on %s', self)
+            return
+        devices = self.device_display.devices
+        device = devices[0] if devices else None
+        self._jira_widget = TyphosJiraIssueWidget(device=device)
+        self._jira_widget.show()
+
     def _create_ui(self):
         layout = self.layout()
         self.buttons.clear()
-        self.config_button = None
 
-        for template_type in DisplayTypes.names:
-            button = TyphosDisplaySwitcherButton(template_type)
-            self.buttons[template_type] = button
-            button.template_selected.connect(self._template_selected)
-            layout.addWidget(button, 0, Qt.AlignRight)
+        self.help_toggle_button = TyphosHelpToggleButton()
+        layout.addWidget(self.help_toggle_button, 0, Qt.AlignRight)
 
-            friendly_name = template_type.replace('_', ' ')
-            button.setToolTip(f'Switch to {friendly_name}')
+        if not utils.JIRA_URL:
+            self.jira_report_button = None
+        else:
+            self.jira_report_button = TyphosJiraReportButton()
+            self.jira_report_button.clicked.connect(self.new_jira_widget)
+            layout.addWidget(self.jira_report_button, 0, Qt.AlignRight)
 
         self.config_button = TyphosDisplayConfigButton()
         layout.addWidget(self.config_button, 0, Qt.AlignRight)
@@ -422,13 +504,14 @@ class TyphosDisplaySwitcher(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
         if self.device_display is not None:
             self.device_display.force_template = template
 
-    def set_device_display(self, display):
+    def _templates_loaded(self, templates: Dict[str, List[pathlib.Path]]) -> None:
+        ...
+
+    def set_device_display(self, display: TyphosDeviceDisplay) -> None:
         """Typhos hook for setting the associated device display."""
         self.device_display = display
-
-        for template_type in self.buttons:
-            templates = display.templates.get(template_type, [])
-            self.buttons[template_type].templates = templates
+        display.templates_loaded.connect(self._templates_loaded)
+        self._templates_loaded(display.templates)
         self.config_button.set_device_display(display)
 
     def add_device(self, device):
@@ -455,6 +538,275 @@ class TyphosTitleLabel(QtWidgets.QLabel):
             self.toggle_requested.emit()
 
         super().mousePressEvent(event)
+
+
+class TyphosJiraReportButton(TyphosToolButton):
+    """A standard button for Jira reporting with typhos."""
+
+    def __init__(
+        self,
+        icon: str = "exclamation",
+        parent: Optional[QtWidgets.QWidget] = None,
+    ):
+        super().__init__(icon, parent=parent)
+
+        self.setToolTip("Report an issue about this device with Jira")
+
+
+class TyphosHelpToggleButton(TyphosToolButton):
+    """
+    A standard button used to toggle help information display.
+
+    Attributes
+    ----------
+    pop_out : QtCore.Signal
+        A Qt signal indicating a request to pop out the help widget.
+
+    open_in_browser : QtCore.Signal
+        A Qt signal indicating a request to open the help in a browser.
+
+    open_python_docs : QtCore.Signal
+        A Qt signal indicating a request to open the Python docstring
+        information.
+
+    report_jira_issue : QtCore.Signal
+        A Qt signal indicating a request to open the Jira issue reporting
+        widget.
+
+    toggle_help : QtCore.Signal
+        A Qt signal indicating a request to toggle the related help display
+        frame.
+    """
+    pop_out = QtCore.Signal()
+    open_in_browser = QtCore.Signal()
+    open_python_docs = QtCore.Signal()
+    report_jira_issue = QtCore.Signal()
+    toggle_help = QtCore.Signal(bool)
+
+    def __init__(self, icon="question", parent=None):
+        super().__init__(icon, parent=parent)
+        self.setCheckable(True)
+
+    def _clicked(self):
+        """Hook for QToolButton.clicked."""
+        self.toggle_help.emit(self.isChecked())
+
+    def generate_context_menu(self):
+        menu = QtWidgets.QMenu(parent=self)
+
+        if utils.HELP_WEB_ENABLED:
+            pop_out_docs = menu.addAction("Pop &out documentation...")
+            pop_out_docs.triggered.connect(self.pop_out.emit)
+
+            open_in_browser = menu.addAction("Open in &browser...")
+            open_in_browser.triggered.connect(self.open_in_browser.emit)
+
+        open_python_docs = menu.addAction("Open &Python docs...")
+        open_python_docs.triggered.connect(self.open_python_docs.emit)
+
+        def toggle():
+            self.setChecked(not self.isChecked())
+            self._clicked()
+
+        if utils.HELP_WEB_ENABLED:
+            toggle_help = menu.addAction("Toggle &help")
+            toggle_help.triggered.connect(toggle)
+
+        if utils.JIRA_URL:
+            menu.addSeparator()
+            report_issue = menu.addAction("&Report Jira issue...")
+            report_issue.triggered.connect(self.report_jira_issue.emit)
+
+        return menu
+
+
+class TyphosHelpFrame(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
+    """
+    A frame for help information display.
+
+    Attributes
+    ----------
+    tooltip_updated : QtCore.Signal
+        A signal indicating the help tooltip has changed.
+    """
+    tooltip_updated = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self.help = None
+        self.help_web_view = None
+        self._delete_timer = None
+        self.python_docs_browser = None
+
+        self.setContentsMargins(0, 0, 0, 0)
+
+        layout = QtWidgets.QVBoxLayout()
+        self.setLayout(layout)
+        self.devices = []
+        self._jira_widget = None
+
+    def new_jira_widget(self):
+        """Open a new Jira issue reporting widget."""
+        device = self.devices[0] if self.devices else None
+        self._jira_widget = TyphosJiraIssueWidget(device=device)
+        self._jira_widget.show()
+
+    def open_in_browser(self, new=0, autoraise=True):
+        """
+        Open the associated help documentation in the browser.
+
+        Parameters
+        ----------
+        new : int, optional
+            0: the same browser window (the default).
+            1: a new browser window.
+            2: a new browser page ("tab").
+
+        autoraise : bool, optional
+            If possible, autoraise raises the window (the default) or not.
+        """
+        return webbrowser.open(
+            self.help_url.toString(), new=new, autoraise=autoraise
+        )
+
+    def open_python_docs(self, show: bool = True):
+        """Open the Python docstring information in a new window."""
+        if self.python_docs_browser is not None:
+            if show:
+                self.python_docs_browser.show()
+                self.python_docs_browser.raise_()
+            else:
+                self.python_docs_browser.hide()
+            return
+
+        if not show:
+            return
+
+        self.python_docs_browser = QtWidgets.QTextBrowser()
+        help_document = QtGui.QTextDocument()
+        contents = self._tooltip or "Unset"
+        first_line = contents.splitlines()[0]
+        # TODO: later versions of qt will support setMarkdown
+        help_document.setPlainText(contents)
+        self.python_docs_browser.setWindowTitle(first_line)
+        font = QtGui.QFont("Monospace")
+        font.setStyleHint(QtGui.QFont.TypeWriter)
+        # font.setStyleHint(QtGui.QFont.Monospace)
+        self.python_docs_browser.setFont(font)
+        self.python_docs_browser.setDocument(help_document)
+        self.python_docs_browser.show()
+        return self.python_docs_browser
+
+    def _get_tooltip(self):
+        """Update the tooltip based on device information."""
+        tooltip = []
+        # BUG: I'm seeing two devices in `self.devices` for
+        # $ typhos --fake-device 'ophyd.EpicsMotor[{"prefix":"b"}]'
+        for device in sorted(
+            set(self.devices),
+            key=lambda dev: self.devices.index(dev)
+        ):
+            heading = device.name or type(device).__name__
+            tooltip.extend([
+                heading,
+                "-" * len(heading),
+                ""
+            ])
+
+            tooltip.append(
+                inspect.getdoc(device) or
+                inspect.getdoc(type(device)) or
+                "No docstring"
+            )
+            tooltip.append("")
+
+        return "\n".join(tooltip)
+
+    def add_device(self, device):
+        self.devices.append(device)
+
+        self._tooltip = self._get_tooltip()
+        self.tooltip_updated.emit(self._tooltip)
+
+        self.setWindowTitle(f"Help: {device.name}")
+
+    @property
+    def help_url(self):
+        """The full help URL, generated from ``TYPHOS_HELP_URL``."""
+        if not self.devices or not utils.HELP_WEB_ENABLED:
+            return QtCore.QUrl("about:blank")
+
+        device, *_ = self.devices
+        try:
+            device_url = utils.HELP_URL.format(device=device)
+        except Exception:
+            logger.exception("Failed to format confluence URL for device %s",
+                             device)
+            return QtCore.QUrl("about:blank")
+
+        return QtCore.QUrl(device_url)
+
+    def show_help(self):
+        """Show the help information in a QWebEngineView."""
+        if web.TyphosWebEngineView is None:
+            logger.error(
+                "Failed to import QWebEngineView; "
+                "help view is unavailable."
+            )
+            return
+
+        if self.help_web_view:
+            self.help_web_view.show()
+            return
+
+        self.help_web_view = web.TyphosWebEngineView()
+        self.help_web_view.page().setUrl(self.help_url)
+
+        self.help_web_view.setEnabled(True)
+        self.help_web_view.setMinimumSize(QtCore.QSize(100, 400))
+
+        self.layout().addWidget(self.help_web_view)
+
+    def hide_help(self):
+        """Hide the help information QWebEngineView."""
+        if not self.help_web_view:
+            return
+        self.help_web_view.hide()
+        if self._delete_timer is None:
+            self._delete_timer = QtCore.QTimer()
+            self._delete_timer.setInterval(20000)
+            self._delete_timer.setSingleShot(True)
+            self._delete_timer.timeout.connect(self._delete_help_if_hidden)
+            self._delete_timer.start()
+
+    def _delete_help_if_hidden(self):
+        """
+        Slowly react to the help display removal, as setting it back up can be
+        slow and painful.
+        """
+        self._delete_timer = None
+        if self.help_web_view and not self.help_web_view.isVisible():
+            self.layout().removeWidget(self.help_web_view)
+            self.help_web_view.deleteLater()
+            self.help_web_view = None
+
+    def toggle_help(self, show):
+        """
+        Toggle the visibility of the help information QWebEngineView.
+
+        Parameters
+        ----------
+        show : bool
+            Show the help (True) or hide it (False).
+        """
+        if not self.devices:
+            logger.warning("No devices added -> no help")
+            return
+
+        if show:
+            self.show_help()
+        else:
+            self.hide_help()
 
 
 class TyphosDisplayTitle(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
@@ -486,20 +838,71 @@ class TyphosDisplayTitle(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
         self.switcher = TyphosDisplaySwitcher()
 
         self.underline = QtWidgets.QFrame()
-        self.underline.setFrameShape(self.underline.HLine)
-        self.underline.setFrameShadow(self.underline.Plain)
+        self.underline.setFrameShape(self.underline.Shape.HLine)
+        self.underline.setFrameShadow(self.underline.Shadow.Plain)
         self.underline.setLineWidth(10)
+
+        self.notes_edit = TyphosNotesEdit()
 
         self.grid_layout = QtWidgets.QGridLayout()
         self.grid_layout.addWidget(self.label, 0, 0)
-        self.grid_layout.addWidget(self.switcher, 0, 1, Qt.AlignRight)
-        self.grid_layout.addWidget(self.underline, 1, 0, 1, 2)
-        self.grid_layout.setSizeConstraint(self.grid_layout.SetMinimumSize)
+        self.grid_layout.addWidget(self.switcher, 0, 2, Qt.AlignRight)
+        self.grid_layout.addWidget(self.notes_edit, 0, 1, Qt.AlignLeft)
+        self.grid_layout.addWidget(self.underline, 1, 0, 1, 3)
+
+        self.help = TyphosHelpFrame()
+        if utils.HELP_WEB_ENABLED:
+            # Toggle the help web view if we have documentation to show
+            self.switcher.help_toggle_button.toggle_help.connect(
+                self.toggle_help
+            )
+        else:
+            # Otherwise, open the python docs as a fallback
+            self.switcher.help_toggle_button.toggle_help.connect(
+                self.help.open_python_docs
+            )
+        self.switcher.help_toggle_button.pop_out.connect(self.pop_out_help)
+        self.switcher.help_toggle_button.open_in_browser.connect(
+            self.help.open_in_browser
+        )
+        self.switcher.help_toggle_button.open_python_docs.connect(
+            self.help.open_python_docs
+        )
+        self.switcher.help_toggle_button.report_jira_issue.connect(
+            self.help.new_jira_widget
+        )
+        self.help.tooltip_updated.connect(
+            self.switcher.help_toggle_button.setToolTip
+        )
+
+        self.grid_layout.addWidget(self.help, 2, 0, 1, 2)
+
+        self.grid_layout.setSizeConstraint(self.grid_layout.SizeConstraint.SetMinimumSize)
         self.setLayout(self.grid_layout)
 
         # Set the property:
         self.show_switcher = show_switcher
         self.show_underline = show_underline
+
+    def toggle_help(self, show):
+        """Toggle the help visibility."""
+        if self.help is None:
+            return
+
+        self.help.toggle_help(show)
+        if self.help.parent() is None:
+            self.grid_layout.addWidget(self.help, 2, 0, 1, 2)
+
+    def pop_out_help(self):
+        """Pop out the help widget."""
+        if self.help is None:
+            return
+
+        self.help.setParent(None)
+        self.switcher.help_toggle_button.setChecked(True)
+        self.help.show_help()
+        self.help.show()
+        self.help.raise_()
 
     @Property(bool)
     def show_switcher(self):
@@ -515,6 +918,12 @@ class TyphosDisplayTitle(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
         """Typhos hook for setting the associated device."""
         if not self.label.text():
             self.label.setText(device.name)
+
+        if not self.notes_edit.text():
+            self.notes_edit.setup_data(device.name)
+
+        if self.help is not None:
+            self.help.add_device(device)
 
     @QtCore.Property(bool)
     def show_underline(self):
@@ -536,7 +945,7 @@ class TyphosDisplayTitle(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
         self.label.toggle_requested.connect(toggle)
 
     # Make designable properties from the title label available here as well
-    label_alignment = forward_property('label', QtWidgets.QLabel, 'alignment')
+    # label_alignment = forward_property('label', QtWidgets.QLabel, 'alignment')
     label_font = forward_property('label', QtWidgets.QLabel, 'font')
     label_indent = forward_property('label', QtWidgets.QLabel, 'indent')
     label_margin = forward_property('label', QtWidgets.QLabel, 'margin')
@@ -546,13 +955,13 @@ class TyphosDisplayTitle(QtWidgets.QFrame, widgets.TyphosDesignerMixin):
     label_text = forward_property('label', QtWidgets.QLabel, 'text')
     label_textFormat = forward_property('label', QtWidgets.QLabel,
                                         'textFormat')
-    label_textInteractionFlags = forward_property('label', QtWidgets.QLabel,
-                                                  'textInteractionFlags')
+    # label_textInteractionFlags = forward_property('label', QtWidgets.QLabel,
+    #                                               'textInteractionFlags')
     label_wordWrap = forward_property('label', QtWidgets.QLabel, 'wordWrap')
 
     # Make designable properties from the grid_layout
-    layout_margin = forward_property('grid_layout', QtWidgets.QHBoxLayout,
-                                     'margin')
+    # layout_margin = forward_property('grid_layout', QtWidgets.QHBoxLayout,
+    #                                  'margin')
     layout_spacing = forward_property('grid_layout', QtWidgets.QHBoxLayout,
                                       'spacing')
 
@@ -583,13 +992,11 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
         The parent widget.
 
     scrollable : bool, optional
+        Semi-deprecated parameter. Use scroll_option instead.
         If ``True``, put the loaded template into a :class:`QScrollArea`.
-        Otherwise, the display widget will go directly in this widget's layout.
-
-    composite_heuristics : bool, optional
-        Enable composite heuristics, which may change the suggested detailed
-        screen based on the contents of the added device.  See also
-        :meth:`.suggest_composite_screen`.
+        If ``False``, the display widget will go directly in this widget's
+        layout.
+        If omitted, scroll_option is used instead.
 
     embedded_templates : list, optional
         List of embedded templates to use in addition to those found on disk.
@@ -601,37 +1008,52 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
         List of engineering templates to use in addition to those found on
         disk.
 
-    display_type : DisplayTypes, optional
+    display_type : DisplayTypes, str, or int, optional
         The default display type.
+
+    scroll_option : ScrollOptions, str, or int, optional
+        The scroll behavior.
 
     nested : bool, optional
         An optional annotation for a display that may be nested inside another.
     """
 
     # Template types and defaults
-    Q_ENUMS(_DisplayTypes)
+    Q_ENUMS(DisplayTypes)
     TemplateEnum = DisplayTypes  # For convenience
+    template_changed = QtCore.Signal(object)
+    templates_loaded = QtCore.Signal(object)
+    templates: Dict[str, List[pathlib.Path]]
 
-    device_count_threshold = 0
-    signal_count_threshold = 30
-
-    def __init__(self, parent=None, *, scrollable=True,
-                 composite_heuristics=True, embedded_templates=None,
-                 detailed_templates=None, engineering_templates=None,
-                 display_type='detailed_screen', nested=False):
-
-        self._composite_heuristics = composite_heuristics
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget] = None,
+        *,
+        scrollable: Optional[bool] = None,
+        embedded_templates: Optional[list[str]] = None,
+        detailed_templates: Optional[list[str]] = None,
+        engineering_templates: Optional[list[str]] = None,
+        display_type: Union[DisplayTypes, str, int] = 'embedded_screen',
+        scroll_option: Union[ScrollOptions, str, int] = ScrollOptions.auto,
+        nested: bool = False,
+    ):
         self._current_template = None
         self._forced_template = ''
         self._macros = {}
         self._display_widget = None
-        self._scrollable = False
+        self._scroll_option = scroll_option
         self._searched = False
         self._hide_empty = False
         self._nested = nested
 
         self.templates = {name: [] for name in DisplayTypes.names}
         self._display_type = normalize_display_type(display_type)
+
+        if nested and self._display_type == DisplayTypes.detailed_screen:
+            # All nested displays should be embedded by default.
+            # Based on if they have subdevices, they may become detailed
+            # during the template loading process
+            self._display_type = DisplayTypes.embedded_screen
 
         instance_templates = {
             'embedded_screen': embedded_templates or [],
@@ -657,29 +1079,27 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._scroll_area)
 
-        self.scrollable = scrollable
+        if scrollable is None:
+            self.scroll_option = scroll_option
+        else:
+            if scrollable:
+                self.scroll_option = ScrollOptions.scrollbar
+            else:
+                self.scroll_option = ScrollOptions.no_scroll
 
-    @Property(bool)
-    def composite_heuristics(self):
-        """Allow composite screen to be suggested first by heuristics."""
-        return self._composite_heuristics
-
-    @composite_heuristics.setter
-    def composite_heuristics(self, composite_heuristics):
-        self._composite_heuristics = bool(composite_heuristics)
-
-    @Property(bool)
-    def scrollable(self):
+    @Property(_ScrollOptions)
+    def scroll_option(self) -> ScrollOptions:
         """Place the display in a scrollable area."""
-        return self._scrollable
+        return self._scroll_option
 
-    @scrollable.setter
-    def scrollable(self, scrollable):
-        # Switch between using the scroll area layout or
-        if scrollable == self._scrollable:
+    @scroll_option.setter
+    def scroll_option(self, scrollable: ScrollOptions):
+        # Switch the scroll area behavior
+        opt = normalize_scroll_option(scrollable)
+        if opt == self._scroll_option:
             return
 
-        self._scrollable = bool(scrollable)
+        self._scroll_option = opt
         self._move_display_to_layout(self._display_widget)
 
     @Property(bool)
@@ -692,41 +1112,116 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
         if checked != self._hide_empty:
             self._hide_empty = checked
 
+    @property
+    def _layout_in_scroll_area(self) -> bool:
+        """Layout the widget in the scroll area or not, based on settings and template."""
+        if self.scroll_option == ScrollOptions.auto:
+            return self.effective_display_type != DisplayTypes.embedded_screen
+        elif self.scroll_option == ScrollOptions.scrollbar:
+            return True
+        elif self.scroll_option == ScrollOptions.no_scroll:
+            return False
+        return True
+
     def _move_display_to_layout(self, widget):
         if not widget:
             return
 
         widget.setParent(None)
-        if self._scrollable:
+
+        scrollable = self._layout_in_scroll_area
+        if scrollable:
             self._scroll_area.setWidget(widget)
         else:
-            self.layout().addWidget(widget)
+            layout: QtWidgets.QVBoxLayout = self.layout()
+            layout.addWidget(widget, alignment=QtCore.Qt.AlignTop)
 
-        self._scroll_area.setVisible(self._scrollable)
+        self._scroll_area.setVisible(scrollable)
 
-    def _generate_template_menu(self, base_menu):
+    def _get_matching_templates_for_class(
+        self,
+        cls: type,
+        display_type: DisplayTypes,
+    ) -> List[pathlib.Path]:
+        """Get matching templates for the given class."""
+        class_name_prefix = f"{cls.__name__}."
+        return [
+            filename
+            for filename in self.templates[display_type.name]
+            if filename.name.startswith(class_name_prefix)
+        ]
+
+    def _generate_template_menu(self, base_menu: QtWidgets.QMenu) -> None:
         """Generate the template switcher menu, adding it to ``base_menu``."""
-        for view, filenames in self.templates.items():
-            if view.endswith('_screen'):
-                view = view.split('_screen')[0]
-            menu = base_menu.addMenu(view.capitalize())
+        dev = self.device
+        if dev is None:
+            return
 
-            for filename in filenames:
-                def switch_template(*, filename=filename):
-                    self.force_template = filename
+        actions: List[QtWidgets.QAction] = []
 
-                action = menu.addAction(os.path.split(filename)[-1])
-                action.triggered.connect(switch_template)
+        def add_template(filename: pathlib.Path) -> None:
+            def switch_template(*, filename: pathlib.Path = filename):
+                self.force_template = filename
 
-        refresh_action = base_menu.addAction("Refresh Templates")
-        refresh_action.triggered.connect(self._refresh_templates)
+            action = base_menu.addAction(str(filename))
+            action.triggered.connect(switch_template)
+            actions.append(action)
+
+            if self.current_template == filename:
+                base_menu.setDefaultAction(action)
+
+        def add_header(label: str, icon: Optional[QtGui.QIcon] = None) -> None:
+            action = QtWidgets.QWidgetAction(base_menu)
+            label = QtWidgets.QLabel(label)
+            label.setObjectName("menu_template_section")
+            action.setDefaultWidget(label)
+            if icon is not None:
+                action.setIcon(icon)
+            base_menu.addAction(action)
+
+        self._refresh_templates()
+        seen = set()
+
+        for template_type in DisplayTypes:
+            added_header = False
+            for cls in type(dev).mro():
+                matching = self._get_matching_templates_for_class(cls, template_type)
+                templates = set(matching) - seen
+                if not templates:
+                    continue
+
+                def by_match_order(template: pathlib.Path) -> int:
+                    return matching.index(template)
+
+                if not added_header:
+                    add_header(
+                        f"{template_type.friendly_name} screens",
+                        icon=TyphosToolButton.get_icon(
+                            TyphosDisplaySwitcherButton.icons[template_type.name]
+                        ),
+                    )
+                    added_header = True
+
+                base_menu.addSection(f"{cls.__name__}")
+                for filename in sorted(templates, key=by_match_order):
+                    add_template(filename)
+
+        add_header("Typhos default screens")
+        for template in DEFAULT_TEMPLATES_FLATTEN:
+            add_template(template)
+
+        prefix = os.path.commonprefix(
+            [action.text() for action in actions]
+        )
+        # Arbitrary threshold: saving on a few characters is not worth it
+        if len(prefix) > 9:
+            for action in actions:
+                action.setText(action.text()[len(prefix):])
 
     def _refresh_templates(self):
-        """Context menu 'Refresh Templates' clicked."""
-        # Force an update of the display cache.
+        """Force an update of the display cache and look for new ui files."""
         cache.get_global_display_path_cache().update()
         self.search_for_templates()
-        self.load_best_template()
 
     @property
     def current_template(self):
@@ -744,6 +1239,28 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
         if self._display_type != value:
             self._display_type = value
             self.load_best_template()
+
+    @property
+    def effective_display_type(self) -> DisplayTypes:
+        """
+        Return the native display type of the current selected template.
+
+        It's possible to request e.g. an embedded screen or an engineering
+        screen and get the detailed screen or tree instead.
+
+        This returns the actual type of the screen that was chosen for use
+        in code that needs to respond to the actual template in use, rather
+        than the one requested.
+
+        If no template has been selected yet, this falls back to the
+        specified display type.
+        """
+        if self.current_template is None:
+            return self.display_type
+        try:
+            return get_template_display_type(self.current_template)
+        except ValueError:
+            return self.display_type
 
     @property
     def macros(self):
@@ -832,8 +1349,10 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
 
         if not template:
             widget = QtWidgets.QWidget()
+            widget.setObjectName("no_template_standin")
             template = None
         else:
+            template = pathlib.Path(template)
             try:
                 widget = self._load_template(template)
             except Exception as ex:
@@ -841,14 +1360,27 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
                 # If we have a previously defined template
                 if self._current_template is not None:
                     # Fallback to it so users have a choice
-                    widget = self._load_template(self._current_template)
+                    try:
+                        widget = self._load_template(self._current_template)
+                    except Exception:
+                        logger.exception(
+                            "Failed to fall back to previous template: %s",
+                            self._current_template
+                        )
+                        template = None
+                        widget = None
+
                     pydm.exception.raise_to_operator(ex)
                 else:
                     widget = QtWidgets.QWidget()
+                    widget.setObjectName("errored_load_standin")
                     template = None
 
         if widget:
-            widget.setObjectName('display_widget')
+            if widget.objectName():
+                widget.setObjectName(f'{widget.objectName()}_display_widget')
+            else:
+                widget.setObjectName('display_widget')
 
             if widget.layout() is None and widget.minimumSize().width() == 0:
                 # If the widget has no layout, use a fixed size for it.
@@ -871,6 +1403,16 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
 
         self._update_children()
         utils.reload_widget_stylesheet(self)
+        self.updateGeometry()
+        self.template_changed.emit(template)
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        if self._layout_in_scroll_area:
+            return QtCore.QSize(
+                int(self._scroll_area.viewportSizeHint().width() * 1.05),
+                super().minimumSizeHint().height(),
+            )
+        return super().minimumSizeHint()
 
     @property
     def display_widget(self):
@@ -903,11 +1445,20 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
 
     def _load_template(self, filename):
         """Load template from file and return the widget."""
+        filename = pathlib.Path(filename)
         loader = (pydm.display.load_py_file if filename.suffix == '.py'
-                  else pydm.display.load_ui_file)
+                  else utils.load_ui_file)
 
         logger.debug('Load template using %s: %r', loader.__name__, filename)
-        return loader(str(filename), macros=self._macros)
+        try:
+            return loader(str(filename), macros=self._macros)
+        except Exception as ex:
+            display: Optional[pydm.Display] = getattr(ex, "pydm_display", None)
+            if display is not None:
+                display.setObjectName("_typhos_test_suite_ignore_")
+                display.close()
+                display.deleteLater()
+            raise
 
     def _update_children(self):
         """Notify child widgets of this device display + the device."""
@@ -916,7 +1467,7 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
         designer = display.findChildren(widgets.TyphosDesignerMixin) or []
         bases = display.findChildren(utils.TyphosBase) or []
 
-        for widget in set(bases + designer):
+        for widget in set(bases + designer + [display]):
             if device and hasattr(widget, 'add_device'):
                 widget.add_device(device)
 
@@ -963,6 +1514,10 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
            3. The argument ``macros`` is then used to fill/update the final
               macro dictionary.
 
+        This will also register the device's signals in the sig:// plugin.
+        This means that any templates can refer to their device's signals by
+        name.
+
         Parameters
         ----------
         device : ophyd.Device
@@ -977,9 +1532,15 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
             self.devices.clear()
         # Add the device to the cache
         super().add_device(device)
+        logger.debug("Registering signals from device %s", device.name)
+        for component_walk in device.walk_signals():
+            register_signal(component_walk.item)
         self._searched = False
         self.macros = self._build_macros_from_device(device, macros=macros)
         self.load_best_template()
+
+        if not self.windowTitle():
+            self.setWindowTitle(getattr(device, "name", ""))
 
     def search_for_templates(self):
         """Search the filesystem for device-specific templates."""
@@ -1009,12 +1570,7 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
                 logger.debug('Adding macro template %s: %s (total=%d)',
                              display_type, template, len(template_list))
 
-            # 2. Composite heuristics, if enabled
-            if self._composite_heuristics and view == 'detailed':
-                if self.suggest_composite_screen(cls):
-                    template_list.append(DETAILED_TREE_TEMPLATE)
-
-            # 3. Templates based on class hierarchy names
+            # 2. Templates based on class hierarchy names
             filenames = utils.find_templates_for_class(cls, view, paths)
             for filename in filenames:
                 if filename not in template_list:
@@ -1022,11 +1578,19 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
                     logger.debug('Found new template %s: %s (total=%d)',
                                  display_type, filename, len(template_list))
 
+            # 3. Ensure that the detailed tree template makes its way in for
+            #    all top-level screens, if no class-specific screen exists
+            if DETAILED_TREE_TEMPLATE not in template_list:
+                if not self._nested or self.suggest_composite_screen(cls):
+                    template_list.append(DETAILED_TREE_TEMPLATE)
+
             # 4. Default templates
             template_list.extend(
                 [templ for templ in DEFAULT_TEMPLATES[display_type]
                  if templ not in template_list]
             )
+
+        self.templates_loaded.emit(copy.deepcopy(self.templates))
 
     @classmethod
     def suggest_composite_screen(cls, device_cls):
@@ -1038,31 +1602,10 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
         composite : bool
             If True, favor the composite screen.
         """
-        num_devices = 0
-        num_signals = 0
-        for attr, component in utils._get_top_level_components(device_cls):
-            num_devices += issubclass(component.cls, ophyd.Device)
-            num_signals += issubclass(component.cls, ophyd.Signal)
-
-        specific_screens = cls._get_specific_screens(device_cls)
-        if (len(specific_screens) or
-                (num_devices <= cls.device_count_threshold and
-                 num_signals >= cls.signal_count_threshold)):
-            # 1. There's a custom screen - we probably should use them
-            # 2. There aren't many devices, so the composite display isn't
-            #    useful
-            # 3. There are many signals, which should be broken up somehow
-            composite = False
-        else:
-            # 1. No custom screen, or
-            # 2. Many devices or a relatively small number of signals
-            composite = True
-
-        logger.debug(
-            '%s screens=%s num_signals=%d num_devices=%d -> composite=%s',
-            device_cls, specific_screens, num_signals, num_devices, composite
-        )
-        return composite
+        for _, component in utils._get_top_level_components(device_cls):
+            if issubclass(component.cls, ophyd.Device):
+                return True
+        return False
 
     @classmethod
     def from_device(cls, device, template=None, macros=None, **kwargs):
@@ -1122,7 +1665,7 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
             obj = pcdsutils.utils.get_instance_by_name(klass, **kwargs)
         except Exception:
             logger.exception('Failed to generate TyphosDeviceDisplay from '
-                             'device %s', obj)
+                             'class %s', klass)
             return None
 
         return cls.from_device(obj, template=template, macros=macros)
@@ -1134,9 +1677,12 @@ class TyphosDeviceDisplay(utils.TyphosBase, widgets.TyphosDesignerMixin,
 
         That is, screens that are not default Typhos-provided screens.
         """
+        paths = cache.get_global_display_path_cache().paths
         return [
-            template for template in utils.find_templates_for_class(
-                device_cls, 'detailed', utils.DISPLAY_PATHS)
+            template
+            for template in utils.find_templates_for_class(
+                device_cls, "detailed", paths
+            )
             if not utils.is_standard_template(template)
         ]
 
@@ -1256,3 +1802,15 @@ def hide_empty(widget, process_widget=True):
         elif isinstance(widget, typhos_panel.TyphosSignalPanel):
             overall_status = bool(widget._panel_layout.visible_elements)
         widget.setVisible(overall_status)
+
+
+def get_template_display_type(template: Path) -> DisplayTypes:
+    """
+    Returns a template's native display type based on its name.
+
+    Raises a ValueError if the name cannot be determined.
+    """
+    # Either e.g. ClassName.detailed or core built-in like detailed_tree
+    template_name = template.stem
+    display_type = template_name.split(".")[-1].split("_")[0] + "_screen"
+    return normalize_display_type(display_type=display_type)

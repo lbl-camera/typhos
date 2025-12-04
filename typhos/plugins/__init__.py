@@ -1,17 +1,18 @@
-__all__ = ['SignalPlugin', 'SignalConnection', 'register_signal',
-           'HappiPlugin', 'HappiConnection', 'register_client']
+__all__ = [
+    "SignalPlugin",
+    "SignalConnection",
+    "register_signal",
+    "HappiPlugin",
+    "HappiConnection",
+    "register_client",
+]
 import logging
 
-from pydm.data_plugins import add_plugin
-
-from .core import SignalPlugin, SignalConnection, register_signal
-
+from .core import SignalConnection, SignalPlugin, register_signal
 
 logger = logging.getLogger(__name__)
-add_plugin(SignalPlugin)
 
 try:
-    from .happi import HappiPlugin, HappiConnection, register_client
-    add_plugin(HappiPlugin)
+    from .happi import HappiConnection, HappiPlugin, register_client
 except ImportError:
-    logger.warning("Unable to import HappiPlugin")
+    logger.debug("Unable to import HappiPlugin")

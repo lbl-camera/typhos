@@ -4,12 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "typhos"
-dynamic = ["version", "dependencies", "optional-dependencies"]
+classifiers = [ "Development Status :: 5 - Production/Stable", "Natural Language :: English", "Programming Language :: Python :: 3",]
+dynamic = ["version", "readme", "dependencies", "optional-dependencies"]
 description = "Interface generation for ophyd devices"
 authors = [
     {name = "SLAC National Accelerator Laboratory"},
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.9"
+
+[options]
+zip_safe = false
+include_package_data = true
+
+[project.license]
+file = "LICENSE.md"
 
 [project.scripts]
 typhos = "typhos.cli:main"
@@ -28,3 +36,30 @@ files = ["requirements.txt"]
 
 [tool.hatch.metadata.hooks.requirements_txt.optional-dependencies]
 dev = ["dev-requirements.txt"]
+docs = ["docs-requirements.txt"]
+
+[project.entry-points."pydm.widget"]
+TyphosAlarmCirclePlugin = "typhos.alarm:TyphosAlarmCircle"
+TyphosAlarmEllipsePlugin = "typhos.alarm:TyphosAlarmEllipse"
+TyphosAlarmPolygonPlugin = "typhos.alarm:TyphosAlarmPolygon"
+TyphosAlarmRectanglePlugin = "typhos.alarm:TyphosAlarmRectangle"
+TyphosAlarmTrianglePlugin = "typhos.alarm:TyphosAlarmTriangle"
+TyphosCompositeSignalPanelPlugin = "typhos.panel:TyphosCompositeSignalPanel"
+TyphosDeviceDisplayPlugin = "typhos.display:TyphosDeviceDisplay"
+TyphosDisplaySwitcherPlugin = "typhos.display:TyphosDisplaySwitcher"
+TyphosDisplayTitlePlugin = "typhos.display:TyphosDisplayTitle"
+TyphosHelpFramePlugin = "typhos.display:TyphosHelpFrame"
+TyphosMethodButtonPlugin = "typhos.func:TyphosMethodButton"
+TyphosNotesEditPlugin = "typhos.notes:TyphosNotesEdit"
+TyphosPositionerWidgetPlugin = "typhos.positioner:TyphosPositionerWidget"
+TyphosPositionerRowWidgetPlugin = "typhos.positioner:TyphosPositionerRowWidget"
+TyphosRelatedSuiteButtonPlugin = "typhos.related_display:TyphosRelatedSuiteButton"
+TyphosSignalPanelPlugin = "typhos.panel:TyphosSignalPanel"
+
+[project.entry-points."pydm.data_plugin"]
+HappiPlugin = "typhos.plugins:HappiPlugin"
+SignalPlugin = "typhos.plugins:SignalPlugin"
+
+[tool.pytest.ini_options]
+addopts = "--cov=."
+

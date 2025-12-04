@@ -42,7 +42,9 @@ Related Projects
     save.rst
     connections.rst
     python_methods.rst
+    templates.rst
     release_notes.rst
+    upcoming_changes.rst
 
 .. toctree::
     :maxdepth: 3
@@ -54,3 +56,4 @@ Related Projects
     widgets.rst
     plugins.rst
     utils.rst
+    unit_tests.rst
